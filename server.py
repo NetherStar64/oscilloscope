@@ -13,8 +13,10 @@ SAMPLES_PER_PACKET = 512
 NUM_PARTS = TOTAL_SAMPLES // SAMPLES_PER_PACKET
 
 NOMINAL_ADC_SPS = 500_000
+HISTORY_SEC = 0.1
+HISTORY_SAMPLES = int(HISTORY_SEC * NOMINAL_ADC_SPS)
 
-frame_queue = queue.Queue(maxsize=5)
+frame_queue = queue.Queue(maxsize=100)
 
 stats_lock = threading.Lock()
 rx_frame_count = 0
@@ -62,11 +64,16 @@ class LivePlot(QtWidgets.QMainWindow):
         self.setWindowTitle("Oscilloscope")
         self.resize(950, 550)
 
+        self.history_samples = HISTORY_SAMPLES
+        self.history = np.zeros(self.history_samples, dtype=np.uint16)
+        self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
+
         self.plot_widget = pg.PlotWidget()
         self.setCentralWidget(self.plot_widget)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setYRange(0, 4096)
-        self.plot_widget.setXRange(0, TOTAL_SAMPLES)
+        self.plot_widget.setXRange(-HISTORY_SEC, 0.0)
+        self.plot_widget.setLabel("bottom", "Time", units="s")
         self.curve = self.plot_widget.plot(pen=pg.mkPen(color="#00ffff", width=1.5))
 
         self.status = self.statusBar()
@@ -86,12 +93,23 @@ class LivePlot(QtWidgets.QMainWindow):
         self.bench_timer.start(1000)
 
     def update_plot(self):
-        latest = None
+        frames = []
         while not frame_queue.empty():
-            latest = frame_queue.get_nowait()
+            frames.append(frame_queue.get_nowait())
 
-        if latest is not None:
-            self.curve.setData(latest)
+        if not frames:
+            return
+
+        new_data = np.concatenate(frames)
+        n = len(new_data)
+
+        if n >= self.history_samples:
+            self.history[:] = new_data[-self.history_samples:]
+        else:
+            self.history = np.roll(self.history, -n)
+            self.history[-n:] = new_data
+
+        self.curve.setData(self.x_data, self.history)
 
     def update_benchmark(self):
         now = time.perf_counter()
@@ -118,13 +136,13 @@ class LivePlot(QtWidgets.QMainWindow):
             mbps = (d_bytes * 8) / (dt * 1e6)
 
             msg = (
-                f"Sample Speed: {duty_cycle:.2f}% of {nominal_ksps:.0f} kSps  |  " \
-                f"Rate: {effective_ksps:.1f} kS/s ({fps:.1f} FPS)  |  " \
-                f"Network: {mbps:.2f} Mbps" \
+                f"Sample Speed: {duty_cycle:.2f}% of {nominal_ksps:.0f} kSps  |  "
+                f"Rate: {effective_ksps:.1f} kS/s ({fps:.1f} FPS)  |  "
+                f"Network: {mbps:.2f} Mbps"
             )
 
             self.status.showMessage(msg)
-            
+
 if __name__ == "__main__":
     t = threading.Thread(target=udp_worker, daemon=True)
     t.start()
