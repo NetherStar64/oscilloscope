@@ -66,10 +66,10 @@ int main()
     uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     uint chan = pwm_gpio_to_channel(PWM_PIN);
     // 4. Set the clock divider to slow down the 125MHz base clock
-    // 125,000,000 / 2.0 = 62,500,000 Hz internal counter frequency
-    pwm_set_clkdiv(slice_num, 2.0f);
+    // 125,000,000 / 2.0 = 6,250,000 Hz internal counter frequency
+    pwm_set_clkdiv(slice_num, 20.0f);
     // 5. Set the wrap value (period)
-    // 6,250,000 Hz / 62,500 cycles = 1000 Hz signal frequency
+    // 6,250,000 Hz / 62,500 cycles = 100 Hz signal frequency
     pwm_set_wrap(slice_num, 62499);
     pwm_set_chan_level(slice_num, chan, 31250);
     pwm_set_enabled(slice_num, true);
