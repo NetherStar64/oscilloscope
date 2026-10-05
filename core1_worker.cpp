@@ -21,10 +21,10 @@ void wifi_worker() {
     cyw43_arch_lwip_begin();
     auto udp_conn = udp_new();
     ip_addr_t laptop;
-    if (ipaddr_aton("192.168.178.38", &laptop) == 0) {
+    if (ipaddr_aton(VIEWER_IP, &laptop) == 0) {
         panic("ipaddr_aton failed");
     }
-    s8_t conn_status = udp_connect(udp_conn, &laptop, 4444);
+    s8_t conn_status = udp_connect(udp_conn, &laptop, VIEWER_PORT);
     if (conn_status != 0) {
         panic("Failed connect: %d", conn_status);
     }

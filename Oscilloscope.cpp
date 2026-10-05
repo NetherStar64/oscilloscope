@@ -41,7 +41,7 @@ int main()
     cyw43_arch_enable_sta_mode();
     int res = -1;
     for (int i = 0; i<3; i++) {
-        res = cyw43_arch_wifi_connect_timeout_ms(SSID, WIFI_Pass, WIFI_SECURITY, 10000);
+        res = cyw43_arch_wifi_connect_timeout_ms(SSID, WIFI_PASS, WIFI_SECURITY, 10000);
         if (res == 0) {
             printf("We got da WiFi\n");
             break;
