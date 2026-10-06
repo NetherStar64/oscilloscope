@@ -174,8 +174,12 @@ int main()
     
     while (true) {
         if (procO < overflow_count) {
-            for (int i = 0; i<(overflow_count-procO); i++) {
-                printf("O");
+            if (overflow_count-procO > 5) {
+                printf("X");
+            } else {
+                for (int i = 0; i<(overflow_count-procO); i++) {
+                    printf("O");
+                }
             }
             procO = overflow_count;
         }
