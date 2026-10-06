@@ -5,6 +5,7 @@
 #include "config.h"
 
 extern uint16_t sample_buffers[2][1024];
+extern volatile bool core1_busy;
 uint32_t sample_count;
 
 struct udpsample {
@@ -32,13 +33,18 @@ void wifi_worker() {
     printf("Connected to UDP socket\n");
     cyw43_arch_lwip_end();
 
+    static uint16_t sample_buffer_copy[SAMPLE_BUFFER_SIZE];
+
+    core1_busy = false;
     while (true) {
+        // Wait for new data
         sample_buffer_index = multicore_fifo_pop_blocking();
-        // Work 
-        // uint16_t i0 = sample_buffers[sample_buffer_index][0];
-        // printf("Buffer Number %d (%d): [0] = %d\n", sample_count, sample_buffer_index, i0);
-        
+        memcpy(sample_buffer_copy, &sample_buffers[sample_buffer_index], sizeof(sample_buffer_copy));
+
         const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
+        
+        // Memcpy to prevent tear on overflow
+
         cyw43_arch_lwip_begin();
         for (u8_t i = 0; i<num_packets; i++) {
             struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
@@ -50,7 +56,7 @@ void wifi_worker() {
             pkt->sample_part  = i;
             memcpy(
                 pkt->data, 
-                &sample_buffers[sample_buffer_index][i * SAMPLE_BUFFER_SPLIT], 
+                &sample_buffer_copy[i * SAMPLE_BUFFER_SPLIT], 
                 SAMPLE_BUFFER_SPLIT * sizeof(uint16_t)
             );
 
@@ -61,8 +67,8 @@ void wifi_worker() {
             }
         }
         cyw43_arch_lwip_end();
-        // Work done, notify C0
+        // Work done
         sample_count++;
-        multicore_fifo_push_blocking(0x4141);
+        core1_busy = false;
     }
 };

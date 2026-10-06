@@ -6,6 +6,8 @@
 #include "pico/cyw43_arch.h"
 #include "hardware/pwm.h"
 #include "pico/multicore.h"
+#include "hardware/irq.h"
+
 #include "core1_worker.h"
 #include "config.h"
 #include "wifipassword.h"
@@ -15,9 +17,14 @@
 #define PWM_PIN 2
 
 volatile bool enable_div = false;
+volatile bool firstsample = true;
 
+volatile uint16_t sample_buffers[2][SAMPLE_BUFFER_SIZE];
+static volatile uint overflow_count = 0;
+volatile bool core1_busy = true;
 
-uint16_t sample_buffers[2][SAMPLE_BUFFER_SIZE];
+static int dma_chan0;
+static int dma_chan1;
 
 
 void toggle_div(uint gpio, uint32_t events) {
@@ -30,11 +37,40 @@ void toggle_div(uint gpio, uint32_t events) {
     }
 }
 
+void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
+    // Reset DMA
+    dma_channel_set_transfer_count(dma_chan_finished, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+    dma_channel_set_write_addr(dma_chan_finished, &sample_buffers[finished_buf], false);
+    if (core1_busy) {
+        // Core 1 is busy :(
+        overflow_count++;
+    } else {
+        // Core 1 is doing Lifestyleteilzeit
+        if (multicore_fifo_wready()) {
+            core1_busy = true;
+            multicore_fifo_push_blocking(finished_buf);
+        } else {
+            // How tf?
+            panic("FIFO full?");
+        }
+    }
+}
+
+void dma_irq_handler()  {
+    if (dma_channel_get_irq0_status(dma_chan0)) {
+        dma_irqn_acknowledge_channel(0, dma_chan0);
+        dma_irq_handle_channel(dma_chan0, 0);
+    }
+    if (dma_channel_get_irq0_status(dma_chan1)) {
+        dma_irqn_acknowledge_channel(0, dma_chan1);
+        dma_irq_handle_channel(dma_chan1, 1);
+    }
+}
 
 int main()
 {
     stdio_init_all();
-    printf("=====================\n");
+    printf("\n=====================\n");
     printf("Init Oscilloscope\n");
 
     cyw43_arch_init_with_country(WIFI_COUNTRY);
@@ -62,6 +98,7 @@ int main()
     gpio_pull_up(DIV_TOGGLE_PIN);
     gpio_set_irq_enabled_with_callback(15, GPIO_IRQ_EDGE_FALL, true, toggle_div);
 
+    // PWM Test Signal
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
     uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     uint chan = pwm_gpio_to_channel(PWM_PIN);
@@ -87,48 +124,72 @@ int main()
 //     multicore_reset_core1();
     multicore_launch_core1(wifi_worker);
 
-    int dma_chan = dma_claim_unused_channel(true);
-    dma_channel_config cfg = dma_channel_get_default_config(dma_chan);
-    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
-    channel_config_set_read_increment(&cfg, false);
-    channel_config_set_write_increment(&cfg, true);
-    channel_config_set_dreq(&cfg, DREQ_ADC);
+    dma_chan0 = dma_claim_unused_channel(true);
+    dma_chan1 = dma_claim_unused_channel(true);
+
+    dma_channel_config cfg0 = dma_channel_get_default_config(dma_chan0);
+    channel_config_set_transfer_data_size(&cfg0, DMA_SIZE_16);
+    channel_config_set_read_increment(&cfg0, false); // Static FIFO
+    channel_config_set_write_increment(&cfg0, true);
+    channel_config_set_dreq(&cfg0, DREQ_ADC);
+    // static void channel_config_set_chain_to (dma_channel_config_t * c, uint chain_to)
+    // As soon as tranfer_count = SAMPLE_BUFFER_SIZE, we trigger Channel 1
+    channel_config_set_chain_to(&cfg0, dma_chan1);
+
+    dma_channel_config cfg1 = dma_channel_get_default_config(dma_chan1);
+    channel_config_set_transfer_data_size(&cfg1, DMA_SIZE_16);
+    channel_config_set_read_increment(&cfg1, false);
+    channel_config_set_write_increment(&cfg1, true);
+    channel_config_set_dreq(&cfg1, DREQ_ADC);
+    channel_config_set_chain_to(&cfg1, dma_chan0);
+
+
+    // static void adc_fifo_setup (bool en, bool dreq_en, uint16_t dreq_thresh, bool err_in_fifo, bool byte_shift)
     adc_fifo_setup(true, true, 1, false, false);
-    adc_set_clkdiv(0);
+    adc_set_clkdiv(0); // Max speed 500 ksps
 
-    bool firstsample = true;
+    adc_fifo_drain();
 
-    while (true) {
-        // result = adc_read();
-        // if (enable_div) {
-        //     voltage = result * conversion_factor *2;
-        // } else {
-        //     voltage = result * conversion_factor;
-        // }
-        // printf("Raw ADC Value: %04d, Div %s Voltage: %.3f V\n", result, enable_div? "X" : " ", voltage);
-        adc_fifo_drain();
-        adc_run(true);
-        dma_channel_configure(dma_chan, &cfg, &sample_buffers[sample_buffer_index], &adc_hw->fifo, 1024, true);
-        dma_channel_wait_for_finish_blocking(dma_chan);
-        adc_run(false);
-        
-        if (!firstsample) {
-            multicore_fifo_pop_blocking(); // Wait for done signal of Core 1
-        } else {
-            firstsample = false;
-        }
-        multicore_fifo_push_blocking(sample_buffer_index);
-        // Swap buffer
-        if (sample_buffer_index == 0) {
-            sample_buffer_index = 1;
-        } else {
-            sample_buffer_index = 0;
-        }
-        
-        tight_loop_contents();
-    }
+    // Channel 0, when done we IRQ
+    // static void dma_channel_configure (uint channel, const dma_channel_config_t * config, volatile void * write_addr, const volatile void * read_addr, uint32_t encoded_transfer_count, bool trigger)
+    dma_channel_configure(dma_chan0, &cfg0, &sample_buffers[0], &adc_hw->fifo, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+    // static void dma_irqn_set_channel_enabled (uint irq_index, uint channel, bool enabled)
+    dma_irqn_set_channel_enabled(0, dma_chan0, true);
+    
+    // Channel 1
+    dma_channel_configure(dma_chan1, &cfg1, &sample_buffers[1], &adc_hw->fifo, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+    dma_irqn_set_channel_enabled(0, dma_chan1, true);
 
     
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+    dma_channel_start(dma_chan0);
+    adc_run(true);
+
+    int procO = 0;
+    uint32_t lastprint = time_us_32();
+    uint lastoverflowcount = 0;
+    
+    while (true) {
+        if (procO < overflow_count) {
+            for (int i = 0; i<(overflow_count-procO); i++) {
+                printf("O");
+            }
+            procO = overflow_count;
+        }
+        const uint32_t now_us = time_us_32();
+        if ((now_us - lastprint) > 1000000) {
+            // once per second
+            if (lastoverflowcount < overflow_count) {
+                printf("\n%d Overflows\n", (overflow_count-lastoverflowcount));
+                lastoverflowcount = overflow_count;
+            }
+            lastprint = now_us;
+        }
+
+        sleep_ms(1000/30);
+    }
+
 }
 
 
