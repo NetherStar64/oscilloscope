@@ -4,15 +4,15 @@
 #include "pico/multicore.h"
 #include "config.h"
 
-extern uint16_t sample_buffers[2][1024];
+extern uint16_t sample_buffers[2][SAMPLE_BUFFER_SIZE];
 extern volatile bool core1_busy;
 uint32_t sample_count;
 
-struct udpsample {
+struct __attribute__((packed)) udpsample {
     uint32_t sample_count;
     u8_t sample_part;
     uint8_t padding[3];
-    uint16_t data[512];
+    uint16_t data[SAMPLE_BUFFER_SPLIT];
 };
 
 void wifi_worker() {

@@ -48,7 +48,7 @@ void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
         // Core 1 is doing Lifestyleteilzeit
         if (multicore_fifo_wready()) {
             core1_busy = true;
-            multicore_fifo_push_blocking(finished_buf);
+            multicore_fifo_push_timeout_us(finished_buf, 1000);
         } else {
             // How tf?
             panic("FIFO full?");
@@ -75,6 +75,8 @@ int main()
 
     cyw43_arch_init_with_country(WIFI_COUNTRY);
     cyw43_arch_enable_sta_mode();
+    cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
+
     int res = -1;
     for (int i = 0; i<3; i++) {
         res = cyw43_arch_wifi_connect_timeout_ms(SSID, WIFI_PASS, WIFI_SECURITY, 10000);
