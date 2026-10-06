@@ -4,8 +4,7 @@
 #include "pico/multicore.h"
 #include "config.h"
 
-extern uint16_t sample_buffers[2][SAMPLE_BUFFER_SIZE];
-extern volatile bool core1_busy;
+extern uint16_t sample_buffers[NUM_RING_BUFFERS][SAMPLE_BUFFER_SIZE];
 uint32_t sample_count;
 
 struct __attribute__((packed)) udpsample {
@@ -34,22 +33,23 @@ void wifi_worker() {
     cyw43_arch_lwip_end();
 
     static uint16_t sample_buffer_copy[SAMPLE_BUFFER_SIZE];
-
-    core1_busy = false;
     while (true) {
         // Wait for new data
         sample_buffer_index = multicore_fifo_pop_blocking();
-        memcpy(sample_buffer_copy, &sample_buffers[sample_buffer_index], sizeof(sample_buffer_copy));
+        // Memcopy for no tear
+        memcpy(
+            sample_buffer_copy,
+            sample_buffers[sample_buffer_index], 
+            sizeof(sample_buffer_copy));
+            
+            const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
 
-        const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
-        
-        // Memcpy to prevent tear on overflow
-
-        cyw43_arch_lwip_begin();
-        for (u8_t i = 0; i<num_packets; i++) {
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
+            cyw43_arch_lwip_begin();
+            for (u8_t i = 0; i<num_packets; i++) {
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_POOL);
             if (p==NULL) {
-                panic("pbuf_alloc fail");
+                // alloc failed grr
+                break;
             }
             auto *pkt = static_cast<udpsample*>(p->payload);
             pkt->sample_count = sample_count;
@@ -62,13 +62,14 @@ void wifi_worker() {
 
             s8_t senderr = udp_send(udp_conn, p);
             pbuf_free(p);
-            if (senderr != 0) {
+            if (senderr == ERR_OK || senderr == ERR_MEM) {
+                // We good
+            } else {
                 panic("udp_send fail %d", senderr);
             }
         }
         cyw43_arch_lwip_end();
         // Work done
         sample_count++;
-        core1_busy = false;
     }
-};
+}

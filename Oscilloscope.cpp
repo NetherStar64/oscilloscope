@@ -19,9 +19,11 @@
 volatile bool enable_div = false;
 volatile bool firstsample = true;
 
-volatile uint16_t sample_buffers[2][SAMPLE_BUFFER_SIZE];
+uint16_t sample_buffers[NUM_RING_BUFFERS][SAMPLE_BUFFER_SIZE];
+volatile uint8_t next_sample_buffer = 2; // 0 and 1 are first
+volatile uint8_t dma_chan_buffer[2] = {0,1};
+
 static volatile uint overflow_count = 0;
-volatile bool core1_busy = true;
 
 static int dma_chan0;
 static int dma_chan1;
@@ -38,32 +40,32 @@ void toggle_div(uint gpio, uint32_t events) {
 }
 
 void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
-    // Reset DMA
-    dma_channel_set_transfer_count(dma_chan_finished, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
-    dma_channel_set_write_addr(dma_chan_finished, &sample_buffers[finished_buf], false);
-    if (core1_busy) {
-        // Core 1 is busy :(
-        overflow_count++;
+    if (multicore_fifo_wready()) {
+        multicore_fifo_push_blocking(finished_buf); // Raw FIFO push because we're ready
     } else {
-        // Core 1 is doing Lifestyleteilzeit
-        if (multicore_fifo_wready()) {
-            core1_busy = true;
-            multicore_fifo_push_timeout_us(finished_buf, 1000);
-        } else {
-            // How tf?
-            panic("FIFO full?");
-        }
+        // Core 1 is a slow unc
+        overflow_count++;
+    }
+
+    // Reset DMA
+    const uint8_t dma_slot = (dma_chan_finished == dma_chan0) ? 0 : 1;
+    dma_chan_buffer[dma_slot] = next_sample_buffer;
+    dma_channel_set_transfer_count(dma_chan_finished, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+    dma_channel_set_write_addr(dma_chan_finished, sample_buffers[next_sample_buffer], false);
+    next_sample_buffer += 1;
+    if (next_sample_buffer >= NUM_RING_BUFFERS) {
+        next_sample_buffer = 0;
     }
 }
 
 void dma_irq_handler()  {
     if (dma_channel_get_irq0_status(dma_chan0)) {
         dma_irqn_acknowledge_channel(0, dma_chan0);
-        dma_irq_handle_channel(dma_chan0, 0);
+        dma_irq_handle_channel(dma_chan0, dma_chan_buffer[0]);
     }
     if (dma_channel_get_irq0_status(dma_chan1)) {
         dma_irqn_acknowledge_channel(0, dma_chan1);
-        dma_irq_handle_channel(dma_chan1, 1);
+        dma_irq_handle_channel(dma_chan1, dma_chan_buffer[1]);
     }
 }
 
@@ -98,14 +100,14 @@ int main()
     gpio_init(DIV_TOGGLE_PIN);
     gpio_set_dir(DIV_TOGGLE_PIN, GPIO_IN);
     gpio_pull_up(DIV_TOGGLE_PIN);
-    gpio_set_irq_enabled_with_callback(15, GPIO_IRQ_EDGE_FALL, true, toggle_div);
+    gpio_set_irq_enabled_with_callback(DIV_TOGGLE_PIN, GPIO_IRQ_EDGE_FALL, true, toggle_div);
 
     // PWM Test Signal
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
     uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     uint chan = pwm_gpio_to_channel(PWM_PIN);
     // 4. Set the clock divider to slow down the 125MHz base clock
-    // 125,000,000 / 2.0 = 6,250,000 Hz internal counter frequency
+    // 125,000,000 / 20.0 = 6,250,000 Hz internal counter frequency
     pwm_set_clkdiv(slice_num, 20.0f);
     // 5. Set the wrap value (period)
     // 6,250,000 Hz / 62,500 cycles = 100 Hz signal frequency
@@ -168,9 +170,9 @@ int main()
     dma_channel_start(dma_chan0);
     adc_run(true);
 
-    int procO = 0;
+    uint32_t procO = 0;
     uint32_t lastprint = time_us_32();
-    uint lastoverflowcount = 0;
+    uint32_t lastoverflowcount = 0;
     
     while (true) {
         if (procO < overflow_count) {
@@ -186,8 +188,9 @@ int main()
         const uint32_t now_us = time_us_32();
         if ((now_us - lastprint) > 1000000) {
             // once per second
+            gpio_xor_mask(1 << LED_PIN); // Toggle
             if (lastoverflowcount < overflow_count) {
-                printf("\n%d Overflows\n", (overflow_count-lastoverflowcount));
+                printf("\n%u Overflows\n", (overflow_count-lastoverflowcount));
                 lastoverflowcount = overflow_count;
             }
             lastprint = now_us;
