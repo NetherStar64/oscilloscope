@@ -77,7 +77,6 @@ int main()
 
     cyw43_arch_init_with_country(WIFI_COUNTRY);
     cyw43_arch_enable_sta_mode();
-    cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
 
     int res = -1;
     for (int i = 0; i<3; i++) {
@@ -92,6 +91,9 @@ int main()
     if (res != 0) {
         panic("Didn't connect to Wifi %d\n", res);
     }
+
+    cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
+
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);

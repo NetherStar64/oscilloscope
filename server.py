@@ -17,6 +17,9 @@ NOMINAL_ADC_SPS = 500_000
 HISTORY_SEC = (TOTAL_SAMPLES*2) / NOMINAL_ADC_SPS
 HISTORY_SAMPLES = int(HISTORY_SEC * NOMINAL_ADC_SPS)
 
+# 3.3V ADC Max + 1/2 Voltage divider -> VSCALE = Voltage at Max ADC
+VSCALE = 3.3 / (1/2)
+
 frame_queue = queue.Queue(maxsize=100)
 
 stats_lock = threading.Lock()
@@ -75,6 +78,9 @@ class LivePlot(QtWidgets.QMainWindow):
         self.plot_widget.setYRange(0, 4096)
         self.plot_widget.setXRange(-HISTORY_SEC, 0.0)
         self.plot_widget.setLabel("bottom", "Time", units="s")
+        self.plot_widget.setLabel("left", "Voltage", units="V")
+        self.plot_widget.getAxis("left").setScale(VSCALE / 4096.0)
+
         self.curve = self.plot_widget.plot(pen=pg.mkPen(color="#00ffff", width=1.5))
 
         self.status = self.statusBar()
