@@ -3,6 +3,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/multicore.h"
 #include "config.h"
+#include "wifipassword.h"
 
 extern uint16_t sample_buffers[NUM_RING_BUFFERS][SAMPLE_BUFFER_SIZE];
 uint32_t sample_count;
@@ -42,11 +43,11 @@ void wifi_worker() {
             sample_buffers[sample_buffer_index], 
             sizeof(sample_buffer_copy));
             
-            const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
+        const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
 
+        for (u8_t i = 0; i<num_packets; i++) {
             cyw43_arch_lwip_begin();
-            for (u8_t i = 0; i<num_packets; i++) {
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_POOL);
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
             if (p==NULL) {
                 // alloc failed grr
                 break;
@@ -67,8 +68,8 @@ void wifi_worker() {
             } else {
                 panic("udp_send fail %d", senderr);
             }
+            cyw43_arch_lwip_end();
         }
-        cyw43_arch_lwip_end();
         // Work done
         sample_count++;
     }
