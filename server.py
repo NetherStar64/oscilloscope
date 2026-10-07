@@ -135,8 +135,10 @@ class LivePlot(QtWidgets.QMainWindow):
         self.curve = self.plot_widget.plot(pen=pg.mkPen(color="#00ffff", width=1.5))
 
         controls = QtWidgets.QWidget()
-        controls_layout = QtWidgets.QHBoxLayout(controls)
+        controls_layout = QtWidgets.QGridLayout(controls)
         controls_layout.setContentsMargins(6, 4, 6, 4)
+        controls_layout.setHorizontalSpacing(8)
+        controls_layout.setVerticalSpacing(6)
         self.mode = QtWidgets.QComboBox()
         self.mode.addItems(["Stream samples", "Capture once", "Capture on trigger"])
         self.sample_rate = QtWidgets.QSpinBox()
@@ -160,19 +162,21 @@ class LivePlot(QtWidgets.QMainWindow):
         self.capture_status = QtWidgets.QLabel("No capture received")
         self.last_capture_length = 0
         self.last_capture_overflows = 0
-        for label, widget in (
-            ("Mode", self.mode),
-            ("Sample rate", self.sample_rate),
-            ("Trigger level", self.trigger_voltage),
-            ("Edge", self.edge),
-            ("Trigger", self.trigger_repeat),
-            ("Max length", self.max_capture_length),
-        ):
-            controls_layout.addWidget(QtWidgets.QLabel(label))
-            controls_layout.addWidget(widget)
-        controls_layout.addWidget(self.capture_status)
+        controls_layout.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
+        controls_layout.addWidget(self.mode, 0, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Sample rate"), 0, 2)
+        controls_layout.addWidget(self.sample_rate, 0, 3)
+        controls_layout.addWidget(QtWidgets.QLabel("Trigger level"), 0, 4)
+        controls_layout.addWidget(self.trigger_voltage, 0, 5)
+        controls_layout.addWidget(QtWidgets.QLabel("Trigger edge"), 1, 0)
+        controls_layout.addWidget(self.edge, 1, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("Trigger mode"), 1, 2)
+        controls_layout.addWidget(self.trigger_repeat, 1, 3)
+        controls_layout.addWidget(QtWidgets.QLabel("Max length"), 1, 4)
+        controls_layout.addWidget(self.max_capture_length, 1, 5)
+        controls_layout.addWidget(self.capture_status, 2, 0, 1, 5)
         self.apply_button = QtWidgets.QPushButton("Apply")
-        controls_layout.addWidget(self.apply_button)
+        controls_layout.addWidget(self.apply_button, 2, 5)
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.plot_widget)
         layout.addWidget(controls)

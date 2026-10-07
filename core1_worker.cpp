@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "pico/multicore.h"
+#include "core1_worker.h"
 #include "config.h"
 #include "wifipassword.h"
 #include "pico/util/queue.h"
@@ -380,7 +381,6 @@ void wifi_worker() {
                 }
                 previous_sample = current_sample;
                 have_previous_sample = true;
-            }
             }
         }
 
