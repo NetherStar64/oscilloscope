@@ -25,7 +25,7 @@ queue_t sample_fifo;
 volatile uint8_t next_sample_buffer = 2; // 0 and 1 are first
 volatile uint8_t dma_chan_buffer[2] = {0,1};
 
-static volatile uint overflow_count = 0;
+volatile uint overflow_count = 0;
 
 static int dma_chan0;
 static int dma_chan1;
@@ -165,6 +165,13 @@ int main()
     uint32_t lastoverflowcount = 0;
     
     while (true) {
+        static uint32_t applied_sample_rate = 500000;
+        const uint32_t sample_rate = requested_sample_rate;
+        if (sample_rate != applied_sample_rate) {
+            adc_set_clkdiv(500000.0f / sample_rate - 1.0f);
+            applied_sample_rate = sample_rate;
+        }
+
         if (procO < overflow_count) {
             if (overflow_count-procO > 5) {
                 printf("X");
@@ -195,5 +202,3 @@ int main()
     }
 
 }
-
-
