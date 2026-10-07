@@ -7,13 +7,13 @@
 #include "hardware/pwm.h"
 #include "pico/multicore.h"
 #include "hardware/irq.h"
+#include <malloc.h>
 
 #include "core1_worker.h"
 #include "config.h"
 #include "wifipassword.h"
 
 #define LED_PIN 16
-#define DIV_TOGGLE_PIN 15
 #define PWM_PIN 2
 
 volatile bool enable_div = false;
@@ -27,17 +27,6 @@ static volatile uint overflow_count = 0;
 
 static int dma_chan0;
 static int dma_chan1;
-
-
-void toggle_div(uint gpio, uint32_t events) {
-    static uint32_t last_toggle_us = 0;
-    const uint32_t now_us = time_us_32();
-
-    if ((uint32_t)(now_us - last_toggle_us) >= 300000) {
-        enable_div = !enable_div;
-        last_toggle_us = now_us;
-    }
-}
 
 void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
     if (multicore_fifo_wready()) {
@@ -98,11 +87,6 @@ int main()
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 1);
-
-    gpio_init(DIV_TOGGLE_PIN);
-    gpio_set_dir(DIV_TOGGLE_PIN, GPIO_IN);
-    gpio_pull_up(DIV_TOGGLE_PIN);
-    gpio_set_irq_enabled_with_callback(DIV_TOGGLE_PIN, GPIO_IRQ_EDGE_FALL, true, toggle_div);
 
     // PWM Test Signal
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
