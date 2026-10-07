@@ -8,6 +8,7 @@
 #include "pico/multicore.h"
 #include "hardware/irq.h"
 #include <malloc.h>
+#include "pico/util/queue.h"
 
 #include "core1_worker.h"
 #include "config.h"
@@ -20,6 +21,7 @@ volatile bool enable_div = false;
 volatile bool firstsample = true;
 
 uint16_t sample_buffers[NUM_RING_BUFFERS][SAMPLE_BUFFER_SIZE];
+queue_t sample_fifo;
 volatile uint8_t next_sample_buffer = 2; // 0 and 1 are first
 volatile uint8_t dma_chan_buffer[2] = {0,1};
 
@@ -29,8 +31,8 @@ static int dma_chan0;
 static int dma_chan1;
 
 void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
-    if (multicore_fifo_wready()) {
-        multicore_fifo_push_blocking(finished_buf); // Raw FIFO push because we're ready
+    if (queue_try_add(&sample_fifo, &finished_buf)) {
+        // :)
     } else {
         // Core 1 is a slow unc
         overflow_count++;
@@ -110,6 +112,7 @@ int main()
     float voltage;
 
     uint8_t sample_buffer_index = 0;
+    queue_init(&sample_fifo, sizeof(uint8_t), NUM_RING_BUFFERS);
 
 //     multicore_reset_core1();
     multicore_launch_core1(wifi_worker);
@@ -157,7 +160,8 @@ int main()
     adc_run(true);
 
     uint32_t procO = 0;
-    uint32_t lastprint = time_us_32();
+    uint32_t lastprint1 = time_us_32();
+    uint32_t lastprint2 = time_us_32();
     uint32_t lastoverflowcount = 0;
     
     while (true) {
@@ -172,17 +176,22 @@ int main()
             procO = overflow_count;
         }
         const uint32_t now_us = time_us_32();
-        if ((now_us - lastprint) > 1000000) {
+        if ((now_us - lastprint1) > 1000000) {
             // once per second
-            gpio_xor_mask(1 << LED_PIN); // Toggle
             if (lastoverflowcount < overflow_count) {
                 printf("\n%u Overflows\n", (overflow_count-lastoverflowcount));
                 lastoverflowcount = overflow_count;
             }
-            lastprint = now_us;
+            lastprint1 = now_us;
+        }
+        if ((now_us - lastprint2) > (1000000 / 15)) {
+            // 15 Hz Loop
+            gpio_xor_mask(1 << LED_PIN); // Toggle
+            // printf("Queue %u\n", queue_get_level(&sample_fifo));
+            lastprint2 = now_us;
         }
 
-        sleep_ms(1000/30);
+        sleep_ms(1000/60);
     }
 
 }

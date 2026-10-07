@@ -4,8 +4,10 @@
 #include "pico/multicore.h"
 #include "config.h"
 #include "wifipassword.h"
+#include "pico/util/queue.h"
 
 extern uint16_t sample_buffers[NUM_RING_BUFFERS][SAMPLE_BUFFER_SIZE];
+extern queue_t sample_fifo;
 uint32_t sample_count;
 
 struct __attribute__((packed)) udpsample {
@@ -36,7 +38,7 @@ void wifi_worker() {
     static uint16_t sample_buffer_copy[SAMPLE_BUFFER_SIZE];
     while (true) {
         // Wait for new data
-        sample_buffer_index = multicore_fifo_pop_blocking();
+        queue_remove_blocking(&sample_fifo, &sample_buffer_index);
         // Memcopy for no tear
         memcpy(
             sample_buffer_copy,
@@ -44,9 +46,8 @@ void wifi_worker() {
             sizeof(sample_buffer_copy));
             
         const u8_t num_packets = SAMPLE_BUFFER_SIZE / SAMPLE_BUFFER_SPLIT;
-
+        cyw43_arch_lwip_begin();
         for (u8_t i = 0; i<num_packets; i++) {
-            cyw43_arch_lwip_begin();
             struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
             if (p==NULL) {
                 // alloc failed grr
@@ -69,8 +70,8 @@ void wifi_worker() {
             } else {
                 panic("udp_send fail %d", senderr);
             }
-            cyw43_arch_lwip_end();
         }
+        cyw43_arch_lwip_end();
         // Work done
         sample_count++;
     }
