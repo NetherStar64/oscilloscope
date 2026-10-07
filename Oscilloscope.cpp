@@ -82,7 +82,7 @@ void dma_irq_handler()  {
 
 int main()
 {
-hat ge    stdio_init_all();
+    stdio_init_all();
     printf("\n=====================\n");
     printf("Init Oscilloscope\n");
 
