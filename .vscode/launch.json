@@ -15,6 +15,10 @@
             // "openOCDPreConfigLaunchCommands": [
             //     "set USE_CORE cm0"
             // ],
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 10
+            },
 
             "configFiles": [
                 "interface/cmsis-dap.cfg",

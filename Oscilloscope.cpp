@@ -184,14 +184,14 @@ int main()
             }
             lastprint1 = now_us;
         }
-        if ((now_us - lastprint2) > (1000000 / 15)) {
-            // 15 Hz Loop
+        if ((now_us - lastprint2) > (1000000 / 30)) {
+            // 30 Hz Loop
             gpio_xor_mask(1 << LED_PIN); // Toggle
             // printf("Queue %u\n", queue_get_level(&sample_fifo));
             lastprint2 = now_us;
         }
 
-        sleep_ms(1000/60);
+        sleep_ms(1000/120);
     }
 
 }
