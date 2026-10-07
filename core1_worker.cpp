@@ -25,9 +25,38 @@ volatile uint16_t trigger_level = 2048;
 volatile uint32_t requested_sample_rate = 500000;
 volatile uint32_t control_generation = 0;
 volatile uint32_t requested_capture_length = NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE;
+volatile uint8_t trigger_offset_percent = 50;
+volatile bool acquisition_pause_requested = false;
+volatile bool acquisition_paused = false;
 
 #define CONTROL_PORT 4445
 #define CAPTURE_PORT 4446
+#define STATUS_PORT 4447
+
+enum class ViewerStatus : uint8_t {
+    TriggerHit = 1,
+    DmaOverflow = 2,
+};
+
+static void send_viewer_status(struct udp_pcb *status_conn,
+                               ViewerStatus event,
+                               uint32_t value) {
+    uint8_t message[9] = {'O', 'S', 'C', 'E', static_cast<uint8_t>(event)};
+    memcpy(&message[5], &value, sizeof(value));
+    cyw43_arch_lwip_begin();
+    struct pbuf *packet = pbuf_alloc(PBUF_TRANSPORT, sizeof(message), PBUF_RAM);
+    if (packet != nullptr) {
+        memcpy(packet->payload, message, sizeof(message));
+        const err_t result = udp_send(status_conn, packet);
+        pbuf_free(packet);
+        if (result != ERR_OK) {
+            printf("Viewer status UDP send failed: %d\n", result);
+        }
+    } else {
+        printf("Viewer status UDP packet allocation failed\n");
+    }
+    cyw43_arch_lwip_end();
+}
 
 struct __attribute__((packed)) udpsample {
     uint32_t sample_count;
@@ -41,14 +70,16 @@ struct CaptureHeader {
     uint32_t sample_count;
     uint32_t buffer_capacity;
     uint32_t overflow_count;
+    uint32_t trigger_index;
 };
-static_assert(sizeof(CaptureHeader) == 16, "Capture TCP header must be 16 bytes");
+static_assert(sizeof(CaptureHeader) == 20, "Capture TCP header must be 20 bytes");
 
 struct CaptureTcpState {
     struct tcp_pcb *pcb;
     volatile bool connected;
     volatile bool failed;
     volatile uint32_t acknowledged;
+    volatile uint32_t queued;
 };
 
 static err_t capture_connected(void *arg, struct tcp_pcb *, err_t error) {
@@ -85,46 +116,89 @@ static void capture_error(void *arg, err_t) {
     state->failed = true;
 }
 
-static bool wait_for_tcp(CaptureTcpState &state, uint32_t target_ack) {
-    const uint32_t deadline = time_us_32() + 15000000;
+static bool wait_for_tcp(CaptureTcpState &state, uint32_t target_ack,
+                         uint32_t previous_ack) {
+    const uint32_t deadline = time_us_32() + 5000000;
     while (!state.failed &&
-           (!state.connected || state.acknowledged < target_ack) &&
+           (!state.connected ||
+            (state.acknowledged < target_ack &&
+             state.acknowledged <= previous_ack)) &&
            static_cast<int32_t>(time_us_32() - deadline) < 0) {
-        sleep_ms(1);
+        sleep_us(100);
     }
     return !state.failed && state.connected &&
-           state.acknowledged >= target_ack;
+           (state.acknowledged >= target_ack ||
+            state.acknowledged > previous_ack);
 }
 
 static bool send_tcp_bytes(CaptureTcpState &state,
                            const uint8_t *bytes,
-                           uint32_t length) {
+                           uint32_t length,
+                           bool copy_data) {
     uint32_t offset = 0;
     while (offset < length) {
         if (state.failed) {
+            printf("Capture TCP connection failed at byte %u\n",
+                   static_cast<unsigned>(offset));
             return false;
         }
-        const uint32_t chunk_length = std::min<uint32_t>(length - offset, 1024);
-        const uint32_t target_ack = state.acknowledged + chunk_length;
+        const uint32_t batch_start_ack = state.acknowledged;
+        bool queued_data = false;
         cyw43_arch_lwip_begin();
-        const err_t write_result = state.pcb == nullptr
-            ? ERR_CONN
-            : tcp_write(state.pcb, bytes + offset, chunk_length,
-                        TCP_WRITE_FLAG_COPY);
-        if (write_result == ERR_OK) {
-            tcp_output(state.pcb);
-        }
-        cyw43_arch_lwip_end();
+        while (offset < length) {
+            uint32_t chunk_length = 0;
+            err_t write_result;
+            if (state.pcb == nullptr) {
+                write_result = ERR_CONN;
+            } else {
+                const uint16_t send_space = tcp_sndbuf(state.pcb);
+                chunk_length = std::min<uint32_t>(
+                    std::min<uint32_t>(length - offset, TCP_MSS), send_space);
+                const uint8_t write_flags =
+                    (copy_data ? TCP_WRITE_FLAG_COPY : 0) |
+                    (offset + chunk_length < length
+                        ? TCP_WRITE_FLAG_MORE : 0);
+                write_result = chunk_length == 0
+                    ? ERR_MEM
+                    : tcp_write(state.pcb, bytes + offset, chunk_length,
+                                write_flags);
+                if (write_result == ERR_OK) {
+                    state.queued += chunk_length;
+                    queued_data = true;
+                    offset += chunk_length;
+                }
+            }
 
-        if (write_result == ERR_MEM) {
-            sleep_ms(1);
-            continue;
+            if (write_result == ERR_MEM) {
+                break;
+            }
+            if (write_result != ERR_OK) {
+                cyw43_arch_lwip_end();
+                printf("Capture TCP write failed at byte %u: %d\n",
+                       static_cast<unsigned>(offset), write_result);
+                return false;
+            }
         }
-        if (write_result != ERR_OK ||
-            !wait_for_tcp(state, target_ack)) {
+
+        const err_t output_result = state.pcb == nullptr
+            ? ERR_CONN : tcp_output(state.pcb);
+        cyw43_arch_lwip_end();
+        if (output_result != ERR_OK) {
+            printf("Capture TCP output failed: %d\n", output_result);
             return false;
         }
-        offset += chunk_length;
+
+        const uint32_t total_queued = state.queued;
+        const uint32_t target_ack = queued_data
+            ? std::min<uint32_t>(total_queued,
+                                 batch_start_ack + 8 * TCP_MSS)
+            : batch_start_ack + 1;
+        if (!wait_for_tcp(state, target_ack, batch_start_ack)) {
+            printf("Capture TCP acknowledgement stalled at %u of %u bytes\n",
+                   static_cast<unsigned>(state.acknowledged),
+                   static_cast<unsigned>(target_ack));
+            return false;
+        }
     }
     return true;
 }
@@ -146,6 +220,7 @@ static bool connect_capture_tcp(CaptureTcpState &state,
     tcp_err(state.pcb, capture_error);
     tcp_sent(state.pcb, capture_sent);
     tcp_recv(state.pcb, capture_received);
+    tcp_nagle_disable(state.pcb);
     const err_t connect_result = tcp_connect(
         state.pcb, destination, CAPTURE_PORT, capture_connected);
     if (connect_result != ERR_OK) {
@@ -157,7 +232,7 @@ static bool connect_capture_tcp(CaptureTcpState &state,
     }
     cyw43_arch_lwip_end();
 
-    if (!wait_for_tcp(state, 0)) {
+    if (!wait_for_tcp(state, 0, 0)) {
         printf("Capture TCP connection timed out or failed\n");
         goto connection_failed;
     }
@@ -178,8 +253,16 @@ static bool send_capture_tcp(CaptureTcpState &state,
                              const uint16_t *samples,
                              uint32_t length,
                              uint32_t dropped_buffers,
-                             uint32_t overflow_start) {
+                             uint32_t overflow_start,
+                             uint32_t trigger_index,
+                             uint8_t retries_remaining = 1) {
     if (!connect_capture_tcp(state, destination)) {
+        if (retries_remaining > 0) {
+            printf("Retrying capture TCP connection\n");
+            return send_capture_tcp(state, destination, samples, length,
+                                    dropped_buffers, overflow_start,
+                                    trigger_index, retries_remaining - 1);
+        }
         return false;
     }
 
@@ -188,12 +271,31 @@ static bool send_capture_tcp(CaptureTcpState &state,
         length,
         NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE,
         dropped_buffers,
+        trigger_index,
     };
     uint32_t final_dropped_buffers = dropped_buffers;
-    if (!send_tcp_bytes(state, reinterpret_cast<const uint8_t *>(&header),
-                        sizeof(header)) ||
+    // The paused acquisition path keeps this static capture buffer unchanged
+    // until every zero-copy TCP segment has been acknowledged. Queue the
+    // header with MORE so it can share the first output with the sample data.
+    err_t header_result;
+    cyw43_arch_lwip_begin();
+    if (state.pcb == nullptr) {
+        header_result = ERR_CONN;
+    } else {
+        header_result = tcp_write(
+            state.pcb, &header, sizeof(header),
+            TCP_WRITE_FLAG_COPY | TCP_WRITE_FLAG_MORE);
+        if (header_result == ERR_OK) {
+            state.queued += sizeof(header);
+        }
+    }
+    cyw43_arch_lwip_end();
+    if (header_result != ERR_OK ||
         !send_tcp_bytes(state, reinterpret_cast<const uint8_t *>(samples),
-                        length * sizeof(uint16_t))) {
+                        length * sizeof(uint16_t), false)) {
+        if (header_result != ERR_OK) {
+            printf("Capture TCP header write failed: %d\n", header_result);
+        }
         goto failed;
     }
 
@@ -204,10 +306,11 @@ static bool send_capture_tcp(CaptureTcpState &state,
             0,
             NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE,
             final_dropped_buffers,
+            trigger_index,
         };
         if (!send_tcp_bytes(state,
                             reinterpret_cast<const uint8_t *>(&overflow_update),
-                            sizeof(overflow_update))) {
+                            sizeof(overflow_update), true)) {
             goto failed;
         }
     }
@@ -216,12 +319,30 @@ static bool send_capture_tcp(CaptureTcpState &state,
 failed:
     cyw43_arch_lwip_begin();
     if (state.pcb != nullptr) {
+        tcp_arg(state.pcb, nullptr);
+        tcp_err(state.pcb, nullptr);
+        tcp_sent(state.pcb, nullptr);
+        tcp_recv(state.pcb, nullptr);
         tcp_abort(state.pcb);
         state.pcb = nullptr;
     }
     cyw43_arch_lwip_end();
+    state = {};
+    if (retries_remaining > 0) {
+        printf("Retrying capture TCP transfer\n");
+        return send_capture_tcp(state, destination, samples, length,
+                                dropped_buffers, overflow_start,
+                                trigger_index, retries_remaining - 1);
+    }
     printf("Capture TCP transfer failed\n");
     return false;
+}
+
+static void set_acquisition_paused(bool paused) {
+    acquisition_pause_requested = paused;
+    while (acquisition_paused != paused) {
+        sleep_ms(1);
+    }
 }
 
 static void close_capture_tcp(CaptureTcpState &state) {
@@ -249,15 +370,15 @@ static void control_received(void *, struct udp_pcb *, struct pbuf *packet,
     command[length] = '\0';
     pbuf_free(packet);
 
-    unsigned mode, rate, edge, continuous, capture_length;
+    unsigned mode, rate, edge, continuous, capture_length, offset_percent;
     float voltage;
-    if (sscanf(command, "%u %u %f %u %u %u", &mode, &rate, &voltage, &edge,
-                &continuous, &capture_length) != 6 ||
+    if (sscanf(command, "%u %u %f %u %u %u %u", &mode, &rate, &voltage, &edge,
+                &continuous, &capture_length, &offset_percent) != 7 ||
         mode > 2 || rate < 8 || rate > 500000 || !std::isfinite(voltage) ||
         voltage < 0.0f || voltage > 6.6f || edge > 1 || continuous > 1 ||
         capture_length < SAMPLE_BUFFER_SIZE ||
         capture_length > NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE ||
-        capture_length % SAMPLE_BUFFER_SIZE != 0) {
+        capture_length % SAMPLE_BUFFER_SIZE != 0 || offset_percent > 100) {
         printf("Invalid viewer control command\n");
         return;
     }
@@ -267,6 +388,7 @@ static void control_received(void *, struct udp_pcb *, struct pbuf *packet,
     trigger_edge = static_cast<TriggerEdge>(edge);
     trigger_continuous = continuous != 0;
     requested_capture_length = capture_length;
+    trigger_offset_percent = offset_percent;
     capture_mode = static_cast<CaptureMode>(mode);
     ++control_generation;
     printf("Viewer settings from %s:%u\n", ipaddr_ntoa(address), static_cast<unsigned>(port));
@@ -297,6 +419,11 @@ void wifi_worker() {
     if (ipaddr_aton(VIEWER_IP, &viewer) == 0) {
         panic("ipaddr_aton failed");
     }
+    auto *status_conn = udp_new();
+    if (status_conn == nullptr ||
+        udp_connect(status_conn, &viewer, STATUS_PORT) != ERR_OK) {
+        panic("Failed to start viewer status socket");
+    }
 
     printf("Connected to UDP socket\n");
     cyw43_arch_lwip_end();
@@ -308,8 +435,12 @@ void wifi_worker() {
     bool capture_active = false;
     bool have_previous_sample = false;
     uint16_t previous_sample = 0;
+    uint32_t pretrigger_size = 0;
+    uint32_t pretrigger_write_index = 0;
     uint32_t capture_size = 0;
+    uint32_t capture_trigger_index = UINT32_MAX;
     uint32_t capture_overflow_start = 0;
+    uint32_t last_notified_overflow_count = overflow_count;
     uint32_t observed_generation = control_generation;
     while (true) {
         // Wait for new data
@@ -320,6 +451,13 @@ void wifi_worker() {
             sample_buffers[sample_buffer_index], 
             sizeof(sample_buffer_copy));
 
+        const uint32_t current_overflow_count = overflow_count;
+        if (current_overflow_count != last_notified_overflow_count) {
+            send_viewer_status(status_conn, ViewerStatus::DmaOverflow,
+                               current_overflow_count);
+            last_notified_overflow_count = current_overflow_count;
+        }
+
         const CaptureMode mode = capture_mode;
         const uint32_t generation = control_generation;
         if (generation != observed_generation) {
@@ -327,6 +465,9 @@ void wifi_worker() {
             capture_active = false;
             capture_size = 0;
             have_previous_sample = false;
+            pretrigger_size = 0;
+            pretrigger_write_index = 0;
+            capture_trigger_index = UINT32_MAX;
             observed_generation = generation;
         }
 
@@ -367,17 +508,39 @@ void wifi_worker() {
         if (mode == CaptureMode::Trigger && !capture_active && once_armed) {
             const uint16_t level = trigger_level;
             const TriggerEdge edge = trigger_edge;
+            const uint32_t desired_pretrigger = std::min(
+                max_length - 1,
+                max_length * static_cast<uint32_t>(trigger_offset_percent) / 100);
+            const uint32_t pretrigger_capacity = desired_pretrigger;
             for (size_t i = 0; i < SAMPLE_BUFFER_SIZE; ++i) {
                 const uint16_t current_sample = sample_buffer_copy[i];
-                if (have_previous_sample &&
+                const bool crossed = have_previous_sample &&
                     ((edge == TriggerEdge::Rising &&
                       previous_sample < level && current_sample >= level) ||
                      (edge == TriggerEdge::Falling &&
-                      previous_sample > level && current_sample <= level))) {
+                      previous_sample > level && current_sample <= level));
+                if (crossed && pretrigger_size >= desired_pretrigger) {
                     capture_active = true;
                     capture_overflow_start = overflow_count;
+                    capture_trigger_index = desired_pretrigger;
+                    capture_size = desired_pretrigger;
+                    flash_trigger_led();
+                    send_viewer_status(status_conn, ViewerStatus::TriggerHit,
+                                       desired_pretrigger);
+                    if (desired_pretrigger > 0) {
+                        std::rotate(capture_samples,
+                                    capture_samples + pretrigger_write_index,
+                                    capture_samples + desired_pretrigger);
+                    }
                     start_index = i;
                     break;
+                }
+                if (pretrigger_capacity > 0) {
+                    capture_samples[pretrigger_write_index] = current_sample;
+                    pretrigger_write_index =
+                        (pretrigger_write_index + 1) % pretrigger_capacity;
+                    pretrigger_size =
+                        std::min(pretrigger_size + 1, pretrigger_capacity);
                 }
                 previous_sample = current_sample;
                 have_previous_sample = true;
@@ -400,19 +563,24 @@ void wifi_worker() {
             const uint32_t dropped_buffers = overflow_count - capture_overflow_start;
             once_armed = false;
             capture_active = false;
+            set_acquisition_paused(true);
             if (!send_capture_tcp(capture_connection, &viewer,
                                   capture_samples, capture_size,
-                                  dropped_buffers, capture_overflow_start)) {
+                                  dropped_buffers, capture_overflow_start,
+                                  capture_trigger_index)) {
                 printf("Capture was not delivered to viewer\n");
             }
-            u8_t stale_buffer;
-            while (queue_try_remove(&sample_fifo, &stale_buffer)) {
-            }
+            set_acquisition_paused(false);
             capture_size = 0;
             if (mode == CaptureMode::Trigger && trigger_continuous &&
                 control_generation == generation) {
                 once_armed = true;
                 have_previous_sample = false;
+                pretrigger_size = 0;
+                pretrigger_write_index = 0;
+                capture_trigger_index = UINT32_MAX;
+            } else {
+                capture_trigger_index = UINT32_MAX;
             }
         }
     }

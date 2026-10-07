@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 void wifi_worker();
+void flash_trigger_led();
 
 enum class CaptureMode : uint8_t {
     Stream = 0,
@@ -25,3 +26,6 @@ extern volatile uint16_t trigger_level;
 extern volatile uint32_t requested_sample_rate;
 extern volatile uint32_t control_generation;
 extern volatile uint32_t requested_capture_length;
+extern volatile uint8_t trigger_offset_percent;
+extern volatile bool acquisition_pause_requested;
+extern volatile bool acquisition_paused;

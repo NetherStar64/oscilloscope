@@ -17,6 +17,25 @@
 #define LED_PIN 16
 #define PWM_PIN 2
 
+static int trigger_led_alarm;
+
+static void turn_off_trigger_led(uint) {
+    gpio_put(LED_PIN, 0);
+}
+
+void flash_trigger_led() {
+    static uint32_t last_pulse_us = 0;
+    const uint32_t now_us = time_us_32();
+    if (static_cast<uint32_t>(now_us - last_pulse_us) < 16667) {
+        return;
+    }
+
+    last_pulse_us = now_us;
+    gpio_put(LED_PIN, 1);
+    hardware_alarm_set_target(
+        trigger_led_alarm, delayed_by_us(get_absolute_time(), 750));
+}
+
 volatile bool enable_div = false;
 volatile bool firstsample = true;
 
@@ -29,6 +48,7 @@ volatile uint overflow_count = 0;
 
 static int dma_chan0;
 static int dma_chan1;
+static bool acquisition_stopped = false;
 
 void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
     if (queue_try_add(&sample_fifo, &finished_buf)) {
@@ -62,7 +82,7 @@ void dma_irq_handler()  {
 
 int main()
 {
-    stdio_init_all();
+hat ge    stdio_init_all();
     printf("\n=====================\n");
     printf("Init Oscilloscope\n");
 
@@ -88,7 +108,9 @@ int main()
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 1);
+    gpio_put(LED_PIN, 0);
+    trigger_led_alarm = hardware_alarm_claim_unused(true);
+    hardware_alarm_set_callback(trigger_led_alarm, turn_off_trigger_led);
 
     // PWM Test Signal
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
@@ -161,10 +183,40 @@ int main()
 
     uint32_t procO = 0;
     uint32_t lastprint1 = time_us_32();
-    uint32_t lastprint2 = time_us_32();
     uint32_t lastoverflowcount = 0;
     
     while (true) {
+        if (acquisition_pause_requested && !acquisition_stopped) {
+            irq_set_enabled(DMA_IRQ_0, false);
+            adc_run(false);
+            dma_channel_abort(dma_chan0);
+            dma_channel_abort(dma_chan1);
+            dma_irqn_acknowledge_channel(0, dma_chan0);
+            dma_irqn_acknowledge_channel(0, dma_chan1);
+            adc_fifo_drain();
+            uint8_t stale_buffer;
+            while (queue_try_remove(&sample_fifo, &stale_buffer)) {
+            }
+            next_sample_buffer = 2;
+            dma_chan_buffer[0] = 0;
+            dma_chan_buffer[1] = 1;
+            dma_channel_set_write_addr(dma_chan0, sample_buffers[0], false);
+            dma_channel_set_transfer_count(
+                dma_chan0, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+            dma_channel_set_write_addr(dma_chan1, sample_buffers[1], false);
+            dma_channel_set_transfer_count(
+                dma_chan1, dma_encode_transfer_count(SAMPLE_BUFFER_SIZE), false);
+            acquisition_stopped = true;
+            acquisition_paused = true;
+        } else if (!acquisition_pause_requested && acquisition_stopped) {
+            adc_fifo_drain();
+            irq_set_enabled(DMA_IRQ_0, true);
+            dma_channel_start(dma_chan0);
+            adc_run(true);
+            acquisition_stopped = false;
+            acquisition_paused = false;
+        }
+
         static uint32_t applied_sample_rate = 500000;
         const uint32_t sample_rate = requested_sample_rate;
         if (sample_rate != applied_sample_rate) {
@@ -191,13 +243,6 @@ int main()
             }
             lastprint1 = now_us;
         }
-        if ((now_us - lastprint2) > (1000000 / 30)) {
-            // 30 Hz Loop
-            gpio_xor_mask(1 << LED_PIN); // Toggle
-            // printf("Queue %u\n", queue_get_level(&sample_fifo));
-            lastprint2 = now_us;
-        }
-
         sleep_ms(1000/120);
     }
 

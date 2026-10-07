@@ -1,3 +1,3 @@
 #define SAMPLE_BUFFER_SIZE 1024
 #define SAMPLE_BUFFER_SPLIT 512
-#define NUM_RING_BUFFERS 64 // ~ 128ms
+#define NUM_RING_BUFFERS 84 // ~ 172ms at 500 kS/s

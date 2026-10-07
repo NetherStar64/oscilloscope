@@ -6,11 +6,14 @@
 
 // Memory settings
 #define MEM_ALIGNMENT               4
-#define MEM_SIZE                    8192
-#define MEMP_NUM_TCP_SEG            32
+#define MEM_SIZE                    65536
+#define MEMP_NUM_TCP_SEG            192
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              32
 #define PBUF_POOL_BUFSIZE           1536
+#define TCP_MSS                     1460
+#define TCP_SND_BUF                 (44 * TCP_MSS)
+#define LWIP_TCP_RTO_TIME           1000
 
 // Protocol enabling
 #define LWIP_ARP                    1
