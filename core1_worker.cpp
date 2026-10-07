@@ -50,6 +50,7 @@ void wifi_worker() {
             struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
             if (p==NULL) {
                 // alloc failed grr
+                cyw43_arch_lwip_end();
                 break;
             }
             auto *pkt = static_cast<udpsample*>(p->payload);
