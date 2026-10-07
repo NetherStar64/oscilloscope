@@ -21,6 +21,7 @@ SAMPLE_BUFFER_SIZE = 1024
 MAX_CAPTURE_SAMPLES = NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE
 
 NOMINAL_ADC_SPS = 500_000
+MIN_ADC_SPS = 733
 # HISTORY_SEC = 0.1
 HISTORY_SEC = (TOTAL_SAMPLES*2) / NOMINAL_ADC_SPS
 HISTORY_SAMPLES = int(HISTORY_SEC * NOMINAL_ADC_SPS)
@@ -39,6 +40,7 @@ viewer_address = None
 class StatusEvents(QtCore.QObject):
     trigger_hit = QtCore.pyqtSignal(int)
     overflow = QtCore.pyqtSignal(int)
+    once_state = QtCore.pyqtSignal(bool)
 
 status_events = StatusEvents()
 
@@ -101,6 +103,28 @@ def recv_samples(connection, sample_count):
         offset += received
     return samples
 
+def recv_packed_samples(connection, sample_count):
+    payload_length = (sample_count // 2) * 3 + (sample_count % 2) * 2
+    packed = bytearray(payload_length)
+    view = memoryview(packed)
+    offset = 0
+    while offset < payload_length:
+        received = connection.recv_into(view[offset:], payload_length - offset)
+        if not received:
+            return None
+        offset += received
+
+    samples = np.empty(sample_count, dtype="<u2")
+    pairs = sample_count // 2
+    if pairs:
+        data = np.frombuffer(packed, dtype=np.uint8, count=pairs * 3)
+        data = data.reshape(-1, 3).astype(np.uint16)
+        samples[0:2 * pairs:2] = data[:, 0] | ((data[:, 1] & 0x0f) << 8)
+        samples[1:2 * pairs:2] = (data[:, 1] >> 4) | (data[:, 2] << 4)
+    if sample_count % 2:
+        samples[-1] = packed[-2] | (packed[-1] << 8)
+    return samples
+
 def tcp_capture_worker():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -113,44 +137,79 @@ def tcp_capture_worker():
             with connection:
                 while True:
                     transfer_started = time.perf_counter()
-                    header = recv_exact(connection, 20)
-                    if header is None:
+                    prefix = recv_exact(connection, 4)
+                    if prefix is None:
                         break
-                    magic, sample_count, buffer_capacity, overflow_count, trigger_index = struct.unpack(
-                        "<4sIIII", header
-                    )
+                    if prefix == b"OS13":
+                        header_size = 20
+                    elif prefix in (b"OSCP", b"OS12"):
+                        header_size = 16
+                    else:
+                        capture_queue.put(
+                            (None, 0, 0, None, 0, 0.0, 0,
+                             "Invalid capture header from oscilloscope")
+                        )
+                        break
+                    header_tail = recv_exact(connection, header_size)
+                    if header_tail is None:
+                        capture_queue.put(
+                            (None, 0, 0, None, 0, 0.0, 0,
+                             "Incomplete TCP capture header")
+                        )
+                        break
+                    header = prefix + header_tail
+                    if prefix == b"OS13":
+                        (magic, sample_count, buffer_capacity, overflow_count,
+                         trigger_index, sample_rate) = struct.unpack("<4sIIIII", header)
+                    else:
+                        (magic, sample_count, buffer_capacity, overflow_count,
+                         trigger_index) = struct.unpack("<4sIIII", header)
+                        sample_rate = 0
                     if (
-                        magic != b"OSCP"
-                        or not SAMPLE_BUFFER_SIZE <= buffer_capacity <= MAX_CAPTURE_SAMPLES
+                        not SAMPLE_BUFFER_SIZE <= buffer_capacity <= MAX_CAPTURE_SAMPLES
                         or sample_count > buffer_capacity
                         or (sample_count and trigger_index != 0xFFFFFFFF
                             and trigger_index >= sample_count)
+                        or (magic == b"OS13" and
+                            not 8 <= sample_rate <= NOMINAL_ADC_SPS)
                     ):
                         capture_queue.put(
-                            (None, 0, 0, None, 0.0, "Invalid capture header from oscilloscope")
+                            (None, 0, 0, None, 0, 0.0, 0,
+                             "Invalid capture header from oscilloscope")
                         )
                         break
 
                     if sample_count == 0:
                         capture_queue.put(
-                            (None, buffer_capacity, overflow_count, trigger_index, 0.0, None)
+                            (None, buffer_capacity, overflow_count, trigger_index,
+                             sample_rate, 0.0, 0, None)
                         )
                         continue
 
-                    samples = recv_samples(connection, sample_count)
+                    payload_length = (
+                        (sample_count // 2) * 3 + (sample_count % 2) * 2
+                        if magic in (b"OS12", b"OS13") else sample_count * 2
+                    )
+                    receive_samples = (
+                        recv_packed_samples
+                        if magic in (b"OS12", b"OS13") else recv_samples
+                    )
+                    samples = receive_samples(connection, sample_count)
                     if samples is None:
                         capture_queue.put(
-                            (None, 0, 0, None, 0.0, "Incomplete TCP capture received")
+                            (None, 0, 0, None, 0, 0.0, 0,
+                             "Incomplete TCP capture received")
                         )
                         break
                     transfer_seconds = time.perf_counter() - transfer_started
                     capture_queue.put(
                         (samples, buffer_capacity, overflow_count, trigger_index,
-                         transfer_seconds, None)
+                         sample_rate, transfer_seconds, payload_length, None)
                     )
         except OSError as error:
             capture_queue.put(
-                (None, 0, 0, None, 0.0, f"Capture TCP connection reset: {error}")
+                (None, 0, 0, None, 0, 0.0, 0,
+                 f"Capture TCP connection reset: {error}")
             )
 
 def status_worker():
@@ -165,6 +224,8 @@ def status_worker():
             status_events.trigger_hit.emit(value)
         elif event == 2:
             status_events.overflow.emit(value)
+        elif event == 3:
+            status_events.once_state.emit(bool(value))
 
 class LivePlot(QtWidgets.QMainWindow):
     def __init__(self):
@@ -176,6 +237,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.history_samples = HISTORY_SAMPLES
         self.history = np.zeros(self.history_samples, dtype=np.uint16)
         self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
+        self.history_sample_rate = NOMINAL_ADC_SPS
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -186,23 +248,65 @@ class LivePlot(QtWidgets.QMainWindow):
         self.plot_widget.getAxis("left").setScale(VSCALE / 4096.0)
         self.curve = self.plot_widget.plot(pen=pg.mkPen(color="#00ffff", width=1.5))
         self.trigger_line = pg.InfiniteLine(
-            angle=0, movable=False,
+            angle=0, movable=True,
             pen=pg.mkPen(color="#ff8800", width=1, style=QtCore.Qt.PenStyle.DashLine)
         )
+        self.trigger_line.setHoverPen(
+            pg.mkPen(color="#ffcc66", width=2, style=QtCore.Qt.PenStyle.DashLine)
+        )
+        self.trigger_line.setBounds((0, 4096))
+        self.trigger_line.setToolTip("Drag to adjust the trigger level")
         self.trigger_line.setZValue(10)
         self.plot_widget.addItem(self.trigger_line)
 
+        self.spectrum_widget = pg.PlotWidget()
+        self.spectrum_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_widget.setLabel("bottom", "Frequency", units="Hz")
+        self.spectrum_widget.setLabel("left", "Amplitude", units="V peak")
+        self.spectrum_widget.disableAutoRange()
+        self.spectrum_widget.setXRange(0.0, NOMINAL_ADC_SPS / 2.0, padding=0)
+        self.spectrum_widget.setYRange(0.0, VSCALE / 2.0, padding=0)
+        self.spectrum_curve = self.spectrum_widget.plot(
+            pen=pg.mkPen(color="#00ffff", width=1.5)
+        )
+        self.plot_stack = QtWidgets.QStackedWidget()
+        self.plot_stack.addWidget(self.plot_widget)
+        self.plot_stack.addWidget(self.spectrum_widget)
+
+        self.plot_view = QtWidgets.QComboBox()
+        self.plot_view.addItems(["Time domain", "FFT spectrum"])
+        self.plot_view.setToolTip(
+            "FFT shows single-sided peak amplitude with the DC component removed. "
+            "Use the mouse wheel and drag to zoom and pan; the scale stays fixed "
+            "as new captures arrive."
+        )
+
         self.mode = QtWidgets.QComboBox()
         self.mode.addItems(["Stream samples", "Capture on trigger"])
-        self.sample_rate = QtWidgets.QSpinBox()
-        self.sample_rate.setRange(8, NOMINAL_ADC_SPS)
-        self.sample_rate.setValue(NOMINAL_ADC_SPS)
-        self.sample_rate.setSuffix(" S/s")
+        self.sample_rate = QtWidgets.QComboBox()
+        self.sample_rate_presets = (
+            1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
+            200_000, 500_000,
+        )
+        for rate in self.sample_rate_presets:
+            self.sample_rate.addItem(f"{rate // 1000:g} kS/s", rate)
+        self.sample_rate.addItem("Custom rate...", None)
+        self.sample_rate.setToolTip(
+            "Choose a preset rate or select Custom rate... to enter any supported rate."
+        )
+        self.sample_rate.setCurrentIndex(
+            self.sample_rate.findData(NOMINAL_ADC_SPS)
+        )
+        self.selected_sample_rate = NOMINAL_ADC_SPS
         self.trigger_voltage = QtWidgets.QDoubleSpinBox()
         self.trigger_voltage.setRange(0.0, VSCALE)
-        self.trigger_voltage.setDecimals(2)
+        self.trigger_voltage.setDecimals(3)
+        self.trigger_voltage.setSingleStep(0.01)
         self.trigger_voltage.setValue(VSCALE / 2)
         self.trigger_voltage.setSuffix(" V")
+        self.trigger_voltage.setToolTip(
+            "Set the trigger level here or drag the orange line on the plot."
+        )
         self.edge = QtWidgets.QComboBox()
         self.edge.addItems(["Rising edge", "Falling edge"])
         self.trigger_repeat = QtWidgets.QComboBox()
@@ -212,7 +316,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.trigger_offset.setValue(50)
         self.trigger_offset.setSuffix("% before trigger")
         self.capture_length_ms = QtWidgets.QDoubleSpinBox()
-        self.capture_length_ms.setDecimals(3)
+        self.capture_length_ms.setDecimals(6)
         self.capture_length_ms.setRange(
             SAMPLE_BUFFER_SIZE / NOMINAL_ADC_SPS * 1000,
             MAX_CAPTURE_SAMPLES / NOMINAL_ADC_SPS * 1000,
@@ -224,6 +328,11 @@ class LivePlot(QtWidgets.QMainWindow):
             MAX_CAPTURE_SAMPLES / NOMINAL_ADC_SPS * 1000
         )
         self.capture_length_ms.setSuffix(" ms")
+        self.capture_length_ms.setToolTip(
+            "Capture duration is rounded up to a whole 1,024-sample DMA block. "
+            "The maximum duration depends on sample rate because the device has "
+            "a fixed sample-buffer capacity."
+        )
         self.capture_details = QtWidgets.QLabel("No capture received")
         self.capture_details.setWordWrap(True)
         self.last_capture_length = 0
@@ -237,6 +346,7 @@ class LivePlot(QtWidgets.QMainWindow):
         acquisition_group = QtWidgets.QGroupBox("Acquisition")
         acquisition_form = QtWidgets.QFormLayout(acquisition_group)
         acquisition_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        acquisition_form.addRow("Display", self.plot_view)
         acquisition_form.addRow("Run mode", self.mode)
         acquisition_form.addRow("Sample rate", self.sample_rate)
         acquisition_form.addRow("Capture length", self.capture_length_ms)
@@ -267,7 +377,7 @@ class LivePlot(QtWidgets.QMainWindow):
         indicator_row.addWidget(self.overflow_indicator)
 
         self.capture_rate_label = QtWidgets.QLabel("Captures/s: 0.00")
-        self.last_capture_label = QtWidgets.QLabel("Last capture: --")
+        self.last_capture_label = QtWidgets.QLabel("Last TCP receive: --")
         self.capture_count_label = QtWidgets.QLabel("Total captures: 0")
         self.capture_rate_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         self.last_capture_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
@@ -292,7 +402,7 @@ class LivePlot(QtWidgets.QMainWindow):
         controls_layout.addStretch(1)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self.plot_widget)
+        splitter.addWidget(self.plot_stack)
         splitter.addWidget(controls)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
@@ -306,21 +416,34 @@ class LivePlot(QtWidgets.QMainWindow):
         status_events.overflow.connect(
             self.on_overflow, QtCore.Qt.ConnectionType.QueuedConnection
         )
-        self.apply_button.clicked.connect(self.send_settings)
-        self.capture_once_button.clicked.connect(
-            lambda: self.send_settings(mode_override=1)
+        status_events.once_state.connect(
+            self.on_once_state_changed, QtCore.Qt.ConnectionType.QueuedConnection
         )
+        self.apply_button.clicked.connect(self.send_settings)
+        self.capture_once_button.clicked.connect(self.capture_once_action)
         for widget in (
-            self.mode, self.sample_rate, self.trigger_voltage, self.edge,
+            self.mode, self.trigger_voltage, self.edge,
             self.trigger_repeat, self.capture_length_ms, self.trigger_offset,
         ):
             if isinstance(widget, QtWidgets.QComboBox):
                 widget.currentIndexChanged.connect(self.send_settings)
             else:
                 widget.valueChanged.connect(self.send_settings)
-        self.sample_rate.valueChanged.connect(self.refresh_sample_rate)
+        self.sample_rate.activated.connect(self.select_sample_rate)
+        self.plot_view.currentIndexChanged.connect(self.refresh_plot_view)
         self.trigger_voltage.valueChanged.connect(self.refresh_trigger_line)
         self.mode.currentIndexChanged.connect(self.refresh_trigger_line)
+        self.mode.currentIndexChanged.connect(self.refresh_once_button)
+        self.trigger_repeat.currentIndexChanged.connect(self.refresh_once_button)
+        self.capture_length_ms.editingFinished.connect(
+            self.normalize_capture_length
+        )
+        self.trigger_line.sigPositionChanged.connect(
+            self.sync_trigger_control_from_line
+        )
+        self.trigger_line.sigPositionChangeFinished.connect(
+            self.commit_trigger_line
+        )
 
         self.status = self.statusBar()
         self.status.setStyleSheet("font-size: 13px; font-weight: bold")
@@ -389,10 +512,83 @@ class LivePlot(QtWidgets.QMainWindow):
             self.overflow_flash_timer.start(STATUS_FLASH_DURATION_MS)
         self.capture_details.setText(f"DMA overflow reported: {value} buffer(s).")
 
+    def on_once_state_changed(self, armed):
+        if not self.trigger_once_selected():
+            return
+        state = "ARMED — click to rearm" if armed else "DISARMED — click to arm"
+        self.capture_once_button.setText(f"Trigger once: {state}")
+        self.capture_once_button.setStyleSheet(
+            "background-color: #315b3a;" if armed else "background-color: #663b32;"
+        )
+
+    def trigger_once_selected(self):
+        return (
+            self.mode.currentIndex() == 1
+            and self.trigger_repeat.currentIndex() == 0
+        )
+
+    def refresh_once_button(self, *_):
+        if self.trigger_once_selected():
+            self.capture_once_button.setText(
+                "Trigger once: waiting for device..."
+            )
+        else:
+            self.capture_once_button.setText("Capture once")
+        self.capture_once_button.setStyleSheet("")
+
+    def capture_once_action(self):
+        if self.trigger_once_selected():
+            self.capture_once_button.setText("Trigger once: rearming...")
+            self.send_settings()
+        else:
+            self.send_settings(mode_override=1)
+
     def refresh_trigger_line(self, *_):
         adc_level = self.trigger_voltage.value() / VSCALE * 4096
         self.trigger_line.setValue(adc_level)
         self.trigger_line.setVisible(self.mode.currentIndex() == 1)
+        self.trigger_line.setMovable(self.mode.currentIndex() == 1)
+
+    def sync_trigger_control_from_line(self, *_):
+        voltage = self.trigger_line.value() / 4096 * VSCALE
+        signals_blocked = self.trigger_voltage.blockSignals(True)
+        try:
+            self.trigger_voltage.setValue(voltage)
+        finally:
+            self.trigger_voltage.blockSignals(signals_blocked)
+
+    def commit_trigger_line(self, *_):
+        self.refresh_trigger_line()
+        self.send_settings()
+
+    def refresh_plot_view(self, index):
+        self.plot_stack.setCurrentIndex(index)
+        if index == 1:
+            self.update_spectrum()
+
+    def update_spectrum(self):
+        sample_count = len(self.history)
+        if sample_count < 4 or self.history_sample_rate <= 0:
+            return
+
+        window = np.hanning(sample_count)
+        window_sum = window.sum()
+        if window_sum == 0:
+            return
+
+        centered = self.history.astype(np.float64)
+        centered -= centered.mean()
+        spectrum = np.abs(np.fft.rfft(centered * window))
+        spectrum *= 2.0 / window_sum
+        if sample_count % 2 == 0:
+            spectrum[-1] *= 0.5
+        spectrum *= VSCALE / 4096.0
+        spectrum[0] = 0.0
+        frequencies = np.fft.rfftfreq(
+            sample_count, d=1.0 / self.history_sample_rate
+        )
+
+        self.spectrum_curve.setData(frequencies, spectrum)
 
     def check_device(self):
         address = viewer_address
@@ -401,16 +597,73 @@ class LivePlot(QtWidgets.QMainWindow):
             self.send_settings()
 
     def refresh_sample_rate(self, *_):
-        duration = self.history_samples / self.sample_rate.value()
+        sample_rate = self.sample_rate.currentData()
+        if sample_rate is None:
+            return
+        duration = self.history_samples / sample_rate
         self.x_data = np.linspace(-duration, 0.0, self.history_samples)
         self.plot_widget.setXRange(-duration, 0.0)
         self.capture_length_ms.setRange(
-            SAMPLE_BUFFER_SIZE / self.sample_rate.value() * 1000,
-            MAX_CAPTURE_SAMPLES / self.sample_rate.value() * 1000,
+            SAMPLE_BUFFER_SIZE / sample_rate * 1000,
+            MAX_CAPTURE_SAMPLES / sample_rate * 1000,
         )
         self.capture_length_ms.setSingleStep(
-            SAMPLE_BUFFER_SIZE / self.sample_rate.value() * 1000
+            SAMPLE_BUFFER_SIZE / sample_rate * 1000
         )
+        self.normalize_capture_length()
+
+    def capture_length_samples(self):
+        requested_samples = round(
+            self.capture_length_ms.value() * self.sample_rate_value() / 1000
+        )
+        capture_length = min(
+            MAX_CAPTURE_SAMPLES,
+            max(SAMPLE_BUFFER_SIZE, requested_samples),
+        )
+        return (
+            (capture_length + SAMPLE_BUFFER_SIZE - 1) // SAMPLE_BUFFER_SIZE
+        ) * SAMPLE_BUFFER_SIZE
+
+    def normalize_capture_length(self):
+        sample_rate = self.sample_rate_value()
+        actual_duration_ms = (
+            self.capture_length_samples() / sample_rate * 1000
+        )
+        if abs(self.capture_length_ms.value() - actual_duration_ms) > 1e-6:
+            self.capture_length_ms.setValue(actual_duration_ms)
+            self.send_settings()
+
+    def select_sample_rate(self, index):
+        rate = self.sample_rate.itemData(index)
+        if rate is None:
+            previous_index = self.sample_rate.findData(self.selected_sample_rate)
+            custom_rate, accepted = QtWidgets.QInputDialog.getInt(
+                self,
+                "Custom sample rate",
+                f"Sample rate ({MIN_ADC_SPS:,}–{NOMINAL_ADC_SPS:,} samples/s):",
+                self.selected_sample_rate,
+                MIN_ADC_SPS,
+                NOMINAL_ADC_SPS,
+            )
+            if not accepted:
+                self.sample_rate.setCurrentIndex(previous_index)
+                return
+            rate = custom_rate
+            custom_index = self.sample_rate.findData(rate)
+            if custom_index == -1:
+                custom_index = self.sample_rate.count() - 1
+                self.sample_rate.insertItem(
+                    custom_index, f"{rate:,} S/s (custom)", rate
+                )
+            self.sample_rate.setCurrentIndex(custom_index)
+
+        self.selected_sample_rate = rate
+        self.refresh_sample_rate()
+        self.send_settings()
+
+    def sample_rate_value(self):
+        rate = self.sample_rate.currentData()
+        return rate if rate is not None else self.selected_sample_rate
 
     def send_settings(self, *_, mode_override=None):
         if viewer_address is None:
@@ -420,18 +673,9 @@ class LivePlot(QtWidgets.QMainWindow):
         mode = mode_override
         if mode is None:
             mode = 2 if self.mode.currentIndex() == 1 else 0
-        requested_samples = round(
-            self.capture_length_ms.value() * self.sample_rate.value() / 1000
-        )
-        capture_length = min(
-            MAX_CAPTURE_SAMPLES,
-            max(SAMPLE_BUFFER_SIZE, requested_samples),
-        )
-        capture_length = (
-            (capture_length + SAMPLE_BUFFER_SIZE - 1) // SAMPLE_BUFFER_SIZE
-        ) * SAMPLE_BUFFER_SIZE
+        capture_length = self.capture_length_samples()
         message = (
-            f"{mode} {self.sample_rate.value()} "
+            f"{mode} {self.sample_rate_value()} "
             f"{self.trigger_voltage.value():.4f} {self.edge.currentIndex()} "
             f"{self.trigger_repeat.currentIndex()} {capture_length} "
             f"{self.trigger_offset.value()}"
@@ -441,19 +685,14 @@ class LivePlot(QtWidgets.QMainWindow):
                 message.encode("ascii"), (viewer_address, CONTROL_PORT)
             )
             self.last_control_address = viewer_address
-            if mode_override == 1:
-                self.capture_details.setText(
-                    f"One-shot requested: {capture_length:,} samples "
-                    f"({capture_length / self.sample_rate.value() * 1000:.3f} ms)."
-                )
         except OSError as error:
             self.status.showMessage(f"Could not send settings: {error}")
 
     def update_plot(self):
         capture_updated = False
         while not capture_queue.empty():
-            (samples, buffer_capacity, overflows, trigger_index,
-             transfer_seconds, error) = capture_queue.get_nowait()
+            (samples, buffer_capacity, overflows, trigger_index, sample_rate,
+             transfer_seconds, payload_length, error) = capture_queue.get_nowait()
             if error is not None:
                 self.capture_details.setText(f"Capture error: {error}")
             elif samples is None:
@@ -467,8 +706,9 @@ class LivePlot(QtWidgets.QMainWindow):
                         f"TCP receive {self.last_capture_seconds:.3f}s."
                     )
             else:
+                sample_rate = sample_rate or self.sample_rate_value()
                 max_capture_ms = (
-                    buffer_capacity / self.sample_rate.value() * 1000
+                    buffer_capacity / self.sample_rate_value() * 1000
                 )
                 self.capture_length_ms.setMaximum(max_capture_ms)
                 if self.capture_length_ms.value() > max_capture_ms:
@@ -477,19 +717,22 @@ class LivePlot(QtWidgets.QMainWindow):
                 self.last_capture_overflows = overflows
                 self.last_capture_seconds = transfer_seconds
                 self.history = samples
+                self.history_sample_rate = sample_rate
                 if trigger_index == 0xFFFFFFFF:
-                    self.x_data = np.arange(len(samples)) / self.sample_rate.value()
+                    self.x_data = np.arange(len(samples)) / sample_rate
                     self.plot_widget.setLabel("bottom", "Sample time", units="s")
                 else:
                     self.x_data = (
                         np.arange(len(samples)) - trigger_index
-                    ) / self.sample_rate.value()
+                    ) / sample_rate
                     self.plot_widget.setLabel("bottom", "Time from trigger", units="s")
                 self.plot_widget.setXRange(self.x_data[0], self.x_data[-1])
                 self.curve.setData(self.x_data, self.history)
-                sample_duration = len(samples) / self.sample_rate.value()
+                if self.plot_view.currentIndex() == 1:
+                    self.update_spectrum()
+                sample_duration = len(samples) / sample_rate
                 transfer_rate = (
-                    len(samples) * 2 / transfer_seconds if transfer_seconds else 0
+                    payload_length / transfer_seconds if transfer_seconds else 0
                 )
                 trigger_description = (
                     "not edge-triggered"
@@ -498,7 +741,7 @@ class LivePlot(QtWidgets.QMainWindow):
                 )
                 self.capture_details.setText(
                     f"Capture received: {len(samples):,} samples "
-                    f"({sample_duration * 1000:.3f} ms at {self.sample_rate.value():,} S/s)\n"
+                    f"({sample_duration * 1000:.3f} ms at {sample_rate:,} S/s)\n"
                     f"TCP: {transfer_seconds:.3f} s, {transfer_rate / 1e6:.2f} MB/s\n"
                     f"Trigger: {trigger_description}; DMA overflows: {overflows}; "
                     f"device capacity: {buffer_capacity:,} samples."
@@ -507,7 +750,7 @@ class LivePlot(QtWidgets.QMainWindow):
                 self.reset_overflow_indicator()
                 self.capture_count += 1
                 self.last_capture_label.setText(
-                    f"Last capture: {transfer_seconds:.3f} s, "
+                    f"Last TCP receive: {transfer_seconds:.3f} s, "
                     f"{len(samples):,} samples"
                 )
                 self.capture_count_label.setText(
@@ -526,10 +769,11 @@ class LivePlot(QtWidgets.QMainWindow):
 
         new_data = np.concatenate(frames)
         n = len(new_data)
+        self.history_sample_rate = self.sample_rate_value()
 
         if len(self.history) != self.history_samples:
             self.history = np.zeros(self.history_samples, dtype=np.uint16)
-            duration = self.history_samples / self.sample_rate.value()
+            duration = self.history_samples / self.sample_rate_value()
             self.x_data = np.linspace(-duration, 0.0, self.history_samples)
             self.plot_widget.setXRange(-duration, 0.0)
         if n >= self.history_samples:
@@ -539,6 +783,8 @@ class LivePlot(QtWidgets.QMainWindow):
             self.history[-n:] = new_data
 
         self.curve.setData(self.x_data, self.history)
+        if self.plot_view.currentIndex() == 1:
+            self.update_spectrum()
 
     def update_benchmark(self):
         now = time.perf_counter()
@@ -559,9 +805,9 @@ class LivePlot(QtWidgets.QMainWindow):
             fps = d_frames / dt
             effective_sps = fps * TOTAL_SAMPLES
             effective_ksps = effective_sps / 1000.0
-            nominal_ksps = self.sample_rate.value() / 1000.0
+            nominal_ksps = self.sample_rate_value() / 1000.0
 
-            duty_cycle = (effective_sps / self.sample_rate.value()) * 100.0
+            duty_cycle = (effective_sps / self.sample_rate_value()) * 100.0
             mbps = (d_bytes * 8) / (dt * 1e6)
 
             msg = (

@@ -6,6 +6,7 @@
 #include "config.h"
 #include "wifipassword.h"
 #include "pico/util/queue.h"
+#include "hardware/clocks.h"
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
 #include <algorithm>
@@ -36,6 +37,7 @@ volatile bool acquisition_paused = false;
 enum class ViewerStatus : uint8_t {
     TriggerHit = 1,
     DmaOverflow = 2,
+    TriggerOnceState = 3,
 };
 
 static void send_viewer_status(struct udp_pcb *status_conn,
@@ -71,8 +73,9 @@ struct CaptureHeader {
     uint32_t buffer_capacity;
     uint32_t overflow_count;
     uint32_t trigger_index;
+    uint32_t sample_rate;
 };
-static_assert(sizeof(CaptureHeader) == 20, "Capture TCP header must be 20 bytes");
+static_assert(sizeof(CaptureHeader) == 24, "Capture TCP header must be 24 bytes");
 
 struct CaptureTcpState {
     struct tcp_pcb *pcb;
@@ -248,10 +251,33 @@ connection_failed:
     return false;
 }
 
+static uint32_t pack_capture_samples(uint16_t *samples, uint32_t sample_count) {
+    auto *packed = reinterpret_cast<uint8_t *>(samples);
+    uint32_t output_index = 0;
+    uint32_t sample_index = 0;
+    while (sample_index + 1 < sample_count) {
+        const uint16_t first = samples[sample_index];
+        const uint16_t second = samples[sample_index + 1];
+        packed[output_index++] = static_cast<uint8_t>(first);
+        packed[output_index++] = static_cast<uint8_t>(
+            ((first >> 8) & 0x0f) | ((second & 0x0f) << 4));
+        packed[output_index++] = static_cast<uint8_t>(second >> 4);
+        sample_index += 2;
+    }
+    if (sample_index < sample_count) {
+        const uint16_t last = samples[sample_index];
+        packed[output_index++] = static_cast<uint8_t>(last);
+        packed[output_index++] = static_cast<uint8_t>((last >> 8) & 0x0f);
+    }
+    return output_index;
+}
+
 static bool send_capture_tcp(CaptureTcpState &state,
                              const ip_addr_t *destination,
-                             const uint16_t *samples,
+                             const uint8_t *samples,
+                             uint32_t payload_length,
                              uint32_t length,
+                             uint32_t sample_rate,
                              uint32_t dropped_buffers,
                              uint32_t overflow_start,
                              uint32_t trigger_index,
@@ -259,7 +285,8 @@ static bool send_capture_tcp(CaptureTcpState &state,
     if (!connect_capture_tcp(state, destination)) {
         if (retries_remaining > 0) {
             printf("Retrying capture TCP connection\n");
-            return send_capture_tcp(state, destination, samples, length,
+            return send_capture_tcp(state, destination, samples, payload_length,
+                                    length, sample_rate,
                                     dropped_buffers, overflow_start,
                                     trigger_index, retries_remaining - 1);
         }
@@ -267,11 +294,12 @@ static bool send_capture_tcp(CaptureTcpState &state,
     }
 
     const CaptureHeader header{
-        {'O', 'S', 'C', 'P'},
+        {'O', 'S', '1', '3'},
         length,
         NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE,
         dropped_buffers,
         trigger_index,
+        sample_rate,
     };
     uint32_t final_dropped_buffers = dropped_buffers;
     // The paused acquisition path keeps this static capture buffer unchanged
@@ -292,7 +320,7 @@ static bool send_capture_tcp(CaptureTcpState &state,
     cyw43_arch_lwip_end();
     if (header_result != ERR_OK ||
         !send_tcp_bytes(state, reinterpret_cast<const uint8_t *>(samples),
-                        length * sizeof(uint16_t), false)) {
+                        payload_length, false)) {
         if (header_result != ERR_OK) {
             printf("Capture TCP header write failed: %d\n", header_result);
         }
@@ -302,11 +330,12 @@ static bool send_capture_tcp(CaptureTcpState &state,
     final_dropped_buffers = overflow_count - overflow_start;
     if (final_dropped_buffers > dropped_buffers) {
         const CaptureHeader overflow_update{
-            {'O', 'S', 'C', 'P'},
+            {'O', 'S', '1', '3'},
             0,
             NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE,
             final_dropped_buffers,
             trigger_index,
+            sample_rate,
         };
         if (!send_tcp_bytes(state,
                             reinterpret_cast<const uint8_t *>(&overflow_update),
@@ -330,7 +359,8 @@ failed:
     state = {};
     if (retries_remaining > 0) {
         printf("Retrying capture TCP transfer\n");
-        return send_capture_tcp(state, destination, samples, length,
+        return send_capture_tcp(state, destination, samples, payload_length,
+                                length, sample_rate,
                                 dropped_buffers, overflow_start,
                                 trigger_index, retries_remaining - 1);
     }
@@ -372,9 +402,12 @@ static void control_received(void *, struct udp_pcb *, struct pbuf *packet,
 
     unsigned mode, rate, edge, continuous, capture_length, offset_percent;
     float voltage;
+    const uint32_t minimum_sample_rate =
+        clock_get_hz(clk_adc) / 65537u + 1u;
     if (sscanf(command, "%u %u %f %u %u %u %u", &mode, &rate, &voltage, &edge,
                 &continuous, &capture_length, &offset_percent) != 7 ||
-        mode > 2 || rate < 8 || rate > 500000 || !std::isfinite(voltage) ||
+        mode > 2 || rate < minimum_sample_rate || rate > 500000 ||
+        !std::isfinite(voltage) ||
         voltage < 0.0f || voltage > 6.6f || edge > 1 || continuous > 1 ||
         capture_length < SAMPLE_BUFFER_SIZE ||
         capture_length > NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE ||
@@ -438,6 +471,7 @@ void wifi_worker() {
     uint32_t pretrigger_size = 0;
     uint32_t pretrigger_write_index = 0;
     uint32_t capture_size = 0;
+    uint32_t capture_sample_rate = requested_sample_rate;
     uint32_t capture_trigger_index = UINT32_MAX;
     uint32_t capture_overflow_start = 0;
     uint32_t last_notified_overflow_count = overflow_count;
@@ -469,6 +503,9 @@ void wifi_worker() {
             pretrigger_write_index = 0;
             capture_trigger_index = UINT32_MAX;
             observed_generation = generation;
+            send_viewer_status(
+                status_conn, ViewerStatus::TriggerOnceState,
+                mode == CaptureMode::Trigger && !trigger_continuous ? 1 : 0);
         }
 
         if (mode == CaptureMode::Stream) {
@@ -502,6 +539,7 @@ void wifi_worker() {
         if (mode == CaptureMode::Once && once_armed && !capture_active) {
             capture_active = true;
             capture_overflow_start = overflow_count;
+            capture_sample_rate = requested_sample_rate;
         }
 
         size_t start_index = 0;
@@ -522,8 +560,14 @@ void wifi_worker() {
                 if (crossed && pretrigger_size >= desired_pretrigger) {
                     capture_active = true;
                     capture_overflow_start = overflow_count;
+                    capture_sample_rate = requested_sample_rate;
                     capture_trigger_index = desired_pretrigger;
                     capture_size = desired_pretrigger;
+                    if (!trigger_continuous) {
+                        once_armed = false;
+                        send_viewer_status(
+                            status_conn, ViewerStatus::TriggerOnceState, 0);
+                    }
                     flash_trigger_led();
                     send_viewer_status(status_conn, ViewerStatus::TriggerHit,
                                        desired_pretrigger);
@@ -564,8 +608,11 @@ void wifi_worker() {
             once_armed = false;
             capture_active = false;
             set_acquisition_paused(true);
+            const uint32_t payload_length =
+                pack_capture_samples(capture_samples, capture_size);
             if (!send_capture_tcp(capture_connection, &viewer,
-                                  capture_samples, capture_size,
+                                  reinterpret_cast<const uint8_t *>(capture_samples),
+                                  payload_length, capture_size, capture_sample_rate,
                                   dropped_buffers, capture_overflow_start,
                                   capture_trigger_index)) {
                 printf("Capture was not delivered to viewer\n");
@@ -575,6 +622,8 @@ void wifi_worker() {
             if (mode == CaptureMode::Trigger && trigger_continuous &&
                 control_generation == generation) {
                 once_armed = true;
+                send_viewer_status(
+                    status_conn, ViewerStatus::TriggerOnceState, 1);
                 have_previous_sample = false;
                 pretrigger_size = 0;
                 pretrigger_write_index = 0;

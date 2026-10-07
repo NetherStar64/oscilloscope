@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
+#include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "pico/cyw43_arch.h"
 #include "hardware/pwm.h"
@@ -112,17 +113,24 @@ int main()
     trigger_led_alarm = hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(trigger_led_alarm, turn_off_trigger_led);
 
-    // PWM Test Signal
+    // PWM test signal: choose an integer divider so the period fits the
+    // 16-bit counter, then round the period to the nearest 100 Hz cycle.
     gpio_set_function(PWM_PIN, GPIO_FUNC_PWM);
     uint slice_num = pwm_gpio_to_slice_num(PWM_PIN);
     uint chan = pwm_gpio_to_channel(PWM_PIN);
-    // 4. Set the clock divider to slow down the 125MHz base clock
-    // 125,000,000 / 20.0 = 6,250,000 Hz internal counter frequency
-    pwm_set_clkdiv(slice_num, 20.0f);
-    // 5. Set the wrap value (period)
-    // 6,250,000 Hz / 62,500 cycles = 100 Hz signal frequency
-    pwm_set_wrap(slice_num, 62499);
-    pwm_set_chan_level(slice_num, chan, 31250);
+    constexpr uint32_t pwm_frequency_hz = 100;
+    constexpr uint32_t pwm_max_period = UINT16_MAX + 1u;
+    const uint32_t sys_clock_hz = clock_get_hz(clk_sys);
+    const uint32_t pwm_divider =
+        (sys_clock_hz + pwm_frequency_hz * pwm_max_period - 1) /
+        (pwm_frequency_hz * pwm_max_period);
+    const uint32_t pwm_period =
+        (sys_clock_hz + pwm_divider * pwm_frequency_hz / 2) /
+        (pwm_divider * pwm_frequency_hz);
+    pwm_set_clkdiv(slice_num, static_cast<float>(pwm_divider));
+    pwm_set_wrap(slice_num, static_cast<uint16_t>(pwm_period - 1));
+    pwm_set_chan_level(
+        slice_num, chan, static_cast<uint16_t>(pwm_period / 2));
     pwm_set_enabled(slice_num, true);
 
     adc_init();
@@ -220,7 +228,8 @@ int main()
         static uint32_t applied_sample_rate = 500000;
         const uint32_t sample_rate = requested_sample_rate;
         if (sample_rate != applied_sample_rate) {
-            adc_set_clkdiv(500000.0f / sample_rate - 1.0f);
+            const float adc_clock_hz = static_cast<float>(clock_get_hz(clk_adc));
+            adc_set_clkdiv(adc_clock_hz / sample_rate - 1.0f);
             applied_sample_rate = sample_rate;
         }
 
