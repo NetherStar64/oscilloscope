@@ -4,6 +4,7 @@ import threading
 import queue
 import time
 import contextlib
+from collections import deque
 import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
@@ -18,6 +19,7 @@ STATUS_FLASH_DURATION_MS = 100
 TOTAL_SAMPLES = 1024
 SAMPLES_PER_PACKET = 512
 NUM_PARTS = TOTAL_SAMPLES // SAMPLES_PER_PACKET
+UDP_FRAME_EXPIRY_SEC = 0.25
 NUM_RING_BUFFERS = 84
 SAMPLE_BUFFER_SIZE = 1024
 MAX_CAPTURE_SAMPLES = NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE
@@ -27,6 +29,9 @@ MIN_ADC_SPS = 733
 # HISTORY_SEC = 0.1
 HISTORY_SEC = (TOTAL_SAMPLES*2) / NOMINAL_ADC_SPS
 HISTORY_SAMPLES = int(HISTORY_SEC * NOMINAL_ADC_SPS)
+Y_AXIS_DIVISIONS = 8
+AUTOSCALE_WINDOW_SECONDS = 1.0
+AUTOSCALE_SMOOTHING_SECONDS = 1.0
 
 # 3.3V ADC Max + 1/2 Voltage divider -> VSCALE = Voltage at Max ADC
 VSCALE = 3.3 / (1/2)
@@ -45,6 +50,12 @@ capture_queue = queue.Queue()
 stats_lock = threading.Lock()
 rx_frame_count = 0
 rx_byte_count = 0
+rx_packet_count = 0
+rx_incomplete_count = 0
+device_tx_packet_count = 0
+device_tx_error_count = 0
+device_stream_block_count = 0
+device_dma_drop_count = 0
 viewer_address = None
 worker_stop = threading.Event()
 worker_socket_lock = threading.Lock()
@@ -67,6 +78,38 @@ class VoltageEvents(QtCore.QObject):
     reading = QtCore.pyqtSignal(int, int)
 
 voltage_events = VoltageEvents()
+
+class ScopeViewBox(pg.ViewBox):
+    user_y_interaction = QtCore.pyqtSignal()
+
+    def wheelEvent(self, event, axis=None):
+        super().wheelEvent(event, axis=0)
+
+    def mouseDragEvent(self, event, axis=None):
+        if self.state["mouseEnabled"][1]:
+            self.user_y_interaction.emit()
+        super().mouseDragEvent(event, axis=axis)
+
+class ScopeAxisItem(pg.AxisItem):
+    wheel_zoom = QtCore.pyqtSignal(int)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.wheel_delta = 0
+
+    def wheelEvent(self, event):
+        delta = event.delta()
+        if delta:
+            self.wheel_delta += delta
+            while self.wheel_delta >= 240:
+                self.wheel_zoom.emit(1)
+                self.wheel_delta -= 240
+            while self.wheel_delta <= -240:
+                self.wheel_zoom.emit(-1)
+                self.wheel_delta += 240
+            event.accept()
+        else:
+            event.ignore()
 
 def register_worker_socket(sock):
     with worker_socket_lock:
@@ -98,7 +141,7 @@ def notify_device_seen(address):
     status_events.device_seen.emit(address)
 
 def udp_worker():
-    global rx_frame_count, rx_byte_count
+    global rx_frame_count, rx_byte_count, rx_packet_count, rx_incomplete_count
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -106,6 +149,7 @@ def udp_worker():
         sock.settimeout(0.5)
         register_worker_socket(sock)
         frames = {}
+        frame_first_seen = {}
 
         while not worker_stop.is_set():
             try:
@@ -118,14 +162,33 @@ def udp_worker():
             if sample_part >= NUM_PARTS:
                 continue
             notify_device_seen(sender[0])
+            received_at = time.monotonic()
             data_offset = len(packet) - (SAMPLES_PER_PACKET * 2)
             samples = np.frombuffer(
                 packet, dtype=np.uint16, offset=data_offset,
                 count=SAMPLES_PER_PACKET
             )
 
+            expired_frames = [
+                count for count, first_seen in frame_first_seen.items()
+                if received_at - first_seen > UDP_FRAME_EXPIRY_SEC
+            ]
+            if sample_count not in frames and len(frames) >= 20:
+                expired_frames.append(min(frames))
+            if expired_frames:
+                expired_frames = set(expired_frames)
+                with stats_lock:
+                    rx_incomplete_count += len(expired_frames)
+                for count in expired_frames:
+                    frames.pop(count, None)
+                    frame_first_seen.pop(count, None)
+
+            with stats_lock:
+                rx_packet_count += 1
+                rx_byte_count += len(packet)
             if sample_count not in frames:
                 frames[sample_count] = {}
+                frame_first_seen[sample_count] = received_at
             frames[sample_count][sample_part] = samples
 
             if len(frames[sample_count]) == NUM_PARTS:
@@ -133,16 +196,13 @@ def udp_worker():
                     [frames[sample_count][part] for part in range(NUM_PARTS)]
                 )
                 del frames[sample_count]
+                frame_first_seen.pop(sample_count, None)
                 with stats_lock:
                     rx_frame_count += 1
-                    rx_byte_count += len(packet) * NUM_PARTS
                 if frame_queue.full():
                     with contextlib.suppress(queue.Empty):
                         frame_queue.get_nowait()
                 frame_queue.put(full_frame)
-
-            if len(frames) > 20:
-                del frames[min(frames.keys())]
     except OSError as error:
         report_worker_error("Sample UDP listener", error)
     finally:
@@ -346,17 +406,32 @@ def udp_event_worker(port, worker_name, packet_handler):
         close_worker_socket(sock)
 
 def handle_status_packet(packet):
+    global device_tx_packet_count, device_tx_error_count
+    global device_stream_block_count, device_dma_drop_count
     if len(packet) != 9 or packet[:4] != b"OSCE":
         return False
     event, value = struct.unpack_from("<BI", packet, 4)
     if event == 1:
         status_events.trigger_hit.emit(value)
     elif event == 2:
+        with stats_lock:
+            device_dma_drop_count = value
         status_events.overflow.emit(value)
     elif event == 3:
         status_events.once_state.emit(bool(value))
     elif event == 4:
+        with stats_lock:
+            device_dma_drop_count = 0
         status_events.reset_complete.emit()
+    elif event == 5:
+        with stats_lock:
+            device_tx_packet_count = value
+    elif event == 6:
+        with stats_lock:
+            device_tx_error_count = value
+    elif event == 7:
+        with stats_lock:
+            device_stream_block_count = value
     else:
         return False
     return True
@@ -397,11 +472,24 @@ class LivePlot(QtWidgets.QMainWindow):
         self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
         self.history_sample_rate = NOMINAL_ADC_SPS
         self.last_raw_capture = None
+        self.capture_view_initialized = False
+        self.snapped_capture_length_samples = None
+        self.normalizing_capture_length = False
 
-        self.plot_widget = pg.PlotWidget()
+        self.y_axis = ScopeAxisItem("left")
+        self.scope_view_box = ScopeViewBox()
+        self.plot_widget = pg.PlotWidget(
+            viewBox=self.scope_view_box,
+            axisItems={"left": self.y_axis},
+        )
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self.plot_widget.setYRange(0, 4096)
         self.plot_widget.setXRange(-HISTORY_SEC, 0.0)
+        self.plot_widget.getViewBox().setMouseEnabled(x=True, y=True)
+        self.plot_widget.setToolTip(
+            "Drag and use the mouse wheel over the plot to pan/zoom time. "
+            "Scroll over the Y-axis labels to change volts per division."
+        )
         self.plot_widget.setLabel("bottom", "Time", units="s")
         self.plot_widget.setLabel("left", "Voltage", units="V")
         self.plot_widget.getAxis("left").setScale(VSCALE / 4096.0)
@@ -428,9 +516,82 @@ class LivePlot(QtWidgets.QMainWindow):
         self.spectrum_curve = self.spectrum_widget.plot(
             pen=pg.mkPen(color="#00ffff", width=1.5)
         )
+        self.spectrum_peaks = self.spectrum_widget.plot(
+            [], [], pen=None, symbol="o", symbolSize=8,
+            symbolBrush="#ffcc66", symbolPen=pg.mkPen("#ffffff", width=1),
+        )
+        self.spectrum_peak_labels = []
+        for _ in range(5):
+            label = pg.TextItem(
+                color="#ffcc66", anchor=(0.5, 1.1), fill=(20, 20, 20, 180)
+            )
+            label.setZValue(10)
+            label.hide()
+            self.spectrum_widget.addItem(label)
+            self.spectrum_peak_labels.append(label)
+        self.spectrum_widget.getViewBox().sigRangeChanged.connect(
+            self.keep_spectrum_y_zero
+        )
         self.plot_stack = QtWidgets.QStackedWidget()
-        self.plot_stack.addWidget(self.plot_widget)
+        self.time_view = QtWidgets.QWidget()
+        time_view_layout = QtWidgets.QVBoxLayout(self.time_view)
+        time_view_layout.setContentsMargins(0, 0, 0, 0)
+        time_view_layout.setSpacing(4)
+        axis_controls = QtWidgets.QHBoxLayout()
+        axis_controls.setContentsMargins(6, 4, 6, 0)
+        axis_controls.setSpacing(6)
+        axis_controls.addWidget(QtWidgets.QLabel("Y"))
+        self.y_scale = QtWidgets.QComboBox()
+        self.y_scale_steps = (
+            0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0,
+        )
+        for volts_per_division in self.y_scale_steps:
+            label = (
+                f"{volts_per_division * 1000:g} mV/div"
+                if volts_per_division < 1
+                else f"{volts_per_division:g} V/div"
+            )
+            self.y_scale.addItem(label, volts_per_division)
+        self.y_scale.setCurrentIndex(self.y_scale.findData(1.0))
+        self.y_scale.setToolTip(
+            "Choose a standard vertical scale, or scroll over the Y-axis labels."
+        )
+        self.y_scale.setStyleSheet("QComboBox { max-width: 125px; }")
+        axis_controls.addWidget(self.y_scale)
+        axis_controls.addWidget(QtWidgets.QLabel("Offset"))
+        self.y_position = QtWidgets.QDoubleSpinBox()
+        self.y_position.setRange(-VSCALE, 2 * VSCALE)
+        self.y_position.setDecimals(2)
+        self.y_position.setSingleStep(0.1)
+        self.y_position.setValue(VSCALE / 2)
+        self.y_position.setSuffix(" V")
+        self.y_position.setToolTip(
+            "Vertical center voltage. You can also drag vertically in the plot."
+        )
+        self.y_position.setStyleSheet(
+            "QDoubleSpinBox { max-width: 110px; }"
+        )
+        axis_controls.addWidget(self.y_position)
+        self.auto_y_button = QtWidgets.QPushButton("Auto Y")
+        self.auto_y_button.setCheckable(True)
+        self.auto_y_button.setToolTip(
+            "Fit the recent one-second signal envelope, then smoothly follow "
+            "changes over about one second."
+        )
+        self.auto_y_button.setStyleSheet(
+            "QPushButton { background-color: #303030; color: #eeeeee; "
+            "border: 1px solid #555555; border-radius: 8px; padding: 4px 10px; }"
+            "QPushButton:checked { background-color: #315b3a; "
+            "border-color: #5d9b6a; }"
+        )
+        axis_controls.addWidget(self.auto_y_button)
+        axis_controls.addStretch(1)
+        time_view_layout.addLayout(axis_controls)
+        time_view_layout.addWidget(self.plot_widget, 1)
+        self.plot_stack.addWidget(self.time_view)
         self.plot_stack.addWidget(self.spectrum_widget)
+        self.autoscale_envelope = deque()
+        self.autoscale_last_update = None
 
         self.plot_view = QtWidgets.QComboBox()
         self.plot_view.addItems(["Time domain", "FFT spectrum"])
@@ -486,7 +647,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.trigger_offset.setValue(50)
         self.trigger_offset.setSuffix("% before trigger")
         self.capture_length_ms = QtWidgets.QDoubleSpinBox()
-        self.capture_length_ms.setDecimals(3)
+        self.capture_length_ms.setDecimals(1)
         self.capture_length_ms.setRange(
             SAMPLE_BUFFER_SIZE / NOMINAL_ADC_SPS * 1000,
             MAX_CAPTURE_SAMPLES / NOMINAL_ADC_SPS * 1000,
@@ -497,6 +658,18 @@ class LivePlot(QtWidgets.QMainWindow):
         self.capture_length_ms.setValue(
             MAX_CAPTURE_SAMPLES / NOMINAL_ADC_SPS * 1000
         )
+        initial_capture_samples = MAX_CAPTURE_SAMPLES
+        self.active_settings_mode = self.mode_group.checkedId()
+        self.mode_settings = {
+            0: {
+                "sample_rate": NOMINAL_ADC_SPS,
+                "capture_samples": initial_capture_samples,
+            },
+            1: {
+                "sample_rate": NOMINAL_ADC_SPS,
+                "capture_samples": initial_capture_samples,
+            },
+        }
         self.capture_length_ms.setSuffix(" ms")
         self.capture_length_ms.setToolTip(
             "Capture duration is rounded up to a whole 1,024-sample DMA block. "
@@ -698,16 +871,16 @@ class LivePlot(QtWidgets.QMainWindow):
         self.apply_button.clicked.connect(self.send_settings)
         self.capture_once_button.clicked.connect(self.capture_once_action)
         for widget in (
-            self.trigger_voltage, self.edge, self.capture_length_ms,
-            self.trigger_offset,
+            self.trigger_voltage, self.edge, self.trigger_offset,
         ):
             if isinstance(widget, QtWidgets.QComboBox):
                 widget.currentIndexChanged.connect(self.send_settings)
             else:
                 widget.valueChanged.connect(self.send_settings)
-        self.mode_group.buttonToggled.connect(
-            lambda _button, checked: self.send_settings() if checked else None
+        self.capture_length_ms.valueChanged.connect(
+            self.on_capture_length_changed
         )
+        self.mode_group.buttonToggled.connect(self.on_mode_changed)
         self.trigger_repeat_group.buttonToggled.connect(
             lambda _button, checked: self.send_settings() if checked else None
         )
@@ -716,12 +889,28 @@ class LivePlot(QtWidgets.QMainWindow):
         self.client_average.currentIndexChanged.connect(
             self.refresh_client_average
         )
+        self.y_scale.currentIndexChanged.connect(self.on_manual_y_change)
+        self.y_position.valueChanged.connect(self.on_manual_y_change)
+        self.scope_view_box.user_y_interaction.connect(
+            lambda: self.auto_y_button.setChecked(False)
+        )
+        self.y_axis.wheel_zoom.connect(self.zoom_y_axis)
+        self.plot_widget.getViewBox().sigRangeChanged.connect(
+            self.on_plot_range_changed
+        )
+        self.auto_y_button.toggled.connect(self.on_autoscale_toggled)
         self.trigger_voltage.valueChanged.connect(self.refresh_trigger_line)
         self.mode_group.buttonToggled.connect(self.refresh_trigger_line)
         self.mode_group.buttonToggled.connect(self.refresh_once_button)
         self.trigger_repeat_group.buttonToggled.connect(self.refresh_once_button)
+        self.capture_length_ms.valueChanged.connect(
+            self.refresh_acquisition_time_window
+        )
         self.capture_length_ms.editingFinished.connect(
             self.normalize_capture_length
+        )
+        self.trigger_offset.valueChanged.connect(
+            self.refresh_acquisition_time_window
         )
         self.trigger_line.sigPositionChanged.connect(
             self.sync_trigger_control_from_line
@@ -756,6 +945,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.last_time = time.perf_counter()
         self.last_frames = 0
         self.last_bytes = 0
+        self.last_rx_packets = 0
         self.last_capture_stat_time = self.last_time
         self.last_capture_stat_count = 0
 
@@ -776,6 +966,8 @@ class LivePlot(QtWidgets.QMainWindow):
         self.last_control_address = None
         self.reset_button.clicked.connect(self.soft_reset_scope)
         self.hard_reset_action.triggered.connect(self.hard_reset_scope)
+        self.apply_y_axis_range()
+        self.refresh_acquisition_time_window()
         self.send_settings()
 
         for label in self.findChildren(QtWidgets.QLabel):
@@ -915,6 +1107,9 @@ class LivePlot(QtWidgets.QMainWindow):
         with capture_queue.mutex:
             capture_queue.queue.clear()
         self.last_raw_capture = None
+        self.capture_view_initialized = False
+        self.autoscale_envelope.clear()
+        self.autoscale_last_update = time.monotonic()
         self.last_capture_length = 0
         self.last_capture_overflows = 0
         self.last_capture_seconds = 0.0
@@ -935,6 +1130,17 @@ class LivePlot(QtWidgets.QMainWindow):
             widget.blockSignals(True)
         self.mode_group.button(0).setChecked(True)
         self.trigger_repeat_group.button(0).setChecked(True)
+        self.active_settings_mode = 0
+        self.mode_settings = {
+            0: {
+                "sample_rate": NOMINAL_ADC_SPS,
+                "capture_samples": MAX_CAPTURE_SAMPLES,
+            },
+            1: {
+                "sample_rate": NOMINAL_ADC_SPS,
+                "capture_samples": MAX_CAPTURE_SAMPLES,
+            },
+        }
         self.sample_rate.setCurrentIndex(
             self.sample_rate.findData(NOMINAL_ADC_SPS)
         )
@@ -953,10 +1159,11 @@ class LivePlot(QtWidgets.QMainWindow):
             widget.blockSignals(False)
         for group in (self.mode_group, self.trigger_repeat_group):
             group.blockSignals(False)
+        capture_samples = self.capture_length_samples()
         self.history_samples = max(
-            1, HISTORY_SAMPLES // self.client_average_factor()
+            1, capture_samples // self.client_average_factor()
         )
-        duration = HISTORY_SAMPLES / NOMINAL_ADC_SPS
+        duration = capture_samples / NOMINAL_ADC_SPS
         self.history = np.zeros(self.history_samples, dtype=np.uint16)
         self.x_data = np.linspace(-duration, 0.0, self.history_samples)
         self.history_sample_rate = (
@@ -1030,6 +1237,140 @@ class LivePlot(QtWidgets.QMainWindow):
         if index == 1:
             self.update_spectrum()
 
+    def apply_y_axis_range(self, volts_per_division=None, center_volts=None):
+        if volts_per_division is None:
+            volts_per_division = self.y_scale.currentData()
+        if center_volts is None:
+            center_volts = self.y_position.value()
+        volts_per_division = max(0.01, volts_per_division)
+        half_range_counts = (
+            volts_per_division * Y_AXIS_DIVISIONS * 0.5
+            * 4096 / VSCALE
+        )
+        center_counts = center_volts * 4096 / VSCALE
+        self.plot_widget.setYRange(
+            center_counts - half_range_counts,
+            center_counts + half_range_counts,
+            padding=0,
+        )
+
+    def on_manual_y_change(self, *_):
+        if self.auto_y_button.isChecked():
+            self.auto_y_button.setChecked(False)
+        self.apply_y_axis_range()
+
+    def zoom_y_axis(self, direction):
+        next_index = min(
+            len(self.y_scale_steps) - 1,
+            max(0, self.y_scale.currentIndex() - direction),
+        )
+        if next_index != self.y_scale.currentIndex():
+            self.y_scale.setCurrentIndex(next_index)
+
+    def on_plot_range_changed(self, _view_box, ranges, *_):
+        if self.auto_y_button.isChecked():
+            return
+        y_range = ranges[1]
+        center_volts = (
+            (y_range[0] + y_range[1]) * 0.5 * VSCALE / 4096
+        )
+        was_blocked = self.y_position.blockSignals(True)
+        self.y_position.setValue(center_volts)
+        self.y_position.blockSignals(was_blocked)
+        volts_per_division = (
+            (y_range[1] - y_range[0]) * VSCALE / 4096
+            / Y_AXIS_DIVISIONS
+        )
+        nearest_index = min(
+            range(len(self.y_scale_steps)),
+            key=lambda index: abs(
+                np.log(max(volts_per_division, 1e-9)
+                       / self.y_scale_steps[index])
+            ),
+        )
+        was_blocked = self.y_scale.blockSignals(True)
+        self.y_scale.setCurrentIndex(nearest_index)
+        self.y_scale.blockSignals(was_blocked)
+
+    def on_autoscale_toggled(self, enabled):
+        self.autoscale_envelope.clear()
+        now = time.monotonic()
+        self.autoscale_last_update = now
+        self.autoscale_scale = self.y_scale.currentData()
+        y_range = self.plot_widget.getViewBox().viewRange()[1]
+        self.autoscale_position = (
+            (y_range[0] + y_range[1]) * 0.5 * VSCALE / 4096
+        )
+        if enabled and len(self.history):
+            self.record_autoscale_samples(self.history, now)
+            self.update_autoscale(now)
+
+    def record_autoscale_samples(self, samples, now=None):
+        if not self.auto_y_button.isChecked() or len(samples) == 0:
+            return
+        if now is None:
+            now = time.monotonic()
+        self.autoscale_envelope.append(
+            (now, int(np.min(samples)), int(np.max(samples)))
+        )
+
+    def update_autoscale(self, now=None):
+        if not self.auto_y_button.isChecked() or not self.autoscale_envelope:
+            return
+        if now is None:
+            now = time.monotonic()
+        cutoff = now - AUTOSCALE_WINDOW_SECONDS
+        while (
+            self.autoscale_envelope
+            and self.autoscale_envelope[0][0] < cutoff
+        ):
+            self.autoscale_envelope.popleft()
+        if not self.autoscale_envelope:
+            return
+
+        minimum = min(entry[1] for entry in self.autoscale_envelope)
+        maximum = max(entry[2] for entry in self.autoscale_envelope)
+        span_counts = max(32.0, (maximum - minimum) * 1.2)
+        raw_target_scale = (
+            span_counts * VSCALE / 4096 / Y_AXIS_DIVISIONS
+        )
+        target_scale = min(
+            self.y_scale_steps,
+            key=lambda scale: abs(np.log(max(raw_target_scale, 1e-9) / scale)),
+        )
+        target_position = (minimum + maximum) * 0.5 * VSCALE / 4096
+
+        previous_update = self.autoscale_last_update
+        elapsed = (
+            0.0 if previous_update is None
+            else max(0.0, now - previous_update)
+        )
+        self.autoscale_last_update = now
+        alpha = 1.0 - np.exp(-elapsed / AUTOSCALE_SMOOTHING_SECONDS)
+        self.autoscale_scale += alpha * (
+            target_scale - self.autoscale_scale
+        )
+        self.autoscale_position += alpha * (
+            target_position - self.autoscale_position
+        )
+
+        index = min(
+            range(len(self.y_scale_steps)),
+            key=lambda item: abs(
+                np.log(max(self.autoscale_scale, 1e-9)
+                       / self.y_scale_steps[item])
+            ),
+        )
+        was_blocked = self.y_scale.blockSignals(True)
+        self.y_scale.setCurrentIndex(index)
+        self.y_scale.blockSignals(was_blocked)
+        was_blocked = self.y_position.blockSignals(True)
+        self.y_position.setValue(self.autoscale_position)
+        self.y_position.blockSignals(was_blocked)
+        self.apply_y_axis_range(
+            self.autoscale_scale, self.autoscale_position
+        )
+
     def update_spectrum(self):
         sample_count = len(self.history)
         if sample_count < 4 or self.history_sample_rate <= 0:
@@ -1053,6 +1394,44 @@ class LivePlot(QtWidgets.QMainWindow):
         )
 
         self.spectrum_curve.setData(frequencies, spectrum)
+        peak_indices = np.flatnonzero(
+            (spectrum[1:-1] >= spectrum[:-2])
+            & (spectrum[1:-1] > spectrum[2:])
+        ) + 1
+        peak_indices = peak_indices[
+            (peak_indices > 0) & (peak_indices < len(spectrum) - 1)
+        ]
+        ranked_indices = peak_indices[
+            np.argsort(spectrum[peak_indices])[::-1]
+        ]
+        selected_indices = []
+        for index in ranked_indices:
+            if all(abs(index - selected) > 2 for selected in selected_indices):
+                selected_indices.append(index)
+                if len(selected_indices) == len(self.spectrum_peak_labels):
+                    break
+
+        peak_frequencies = frequencies[selected_indices]
+        peak_amplitudes = spectrum[selected_indices]
+        self.spectrum_peaks.setData(peak_frequencies, peak_amplitudes)
+        for position, label in enumerate(self.spectrum_peak_labels):
+            if position >= len(selected_indices):
+                label.hide()
+                continue
+            frequency = peak_frequencies[position]
+            frequency_label = (
+                f"{frequency / 1000:.2f} kHz"
+                if frequency >= 1000
+                else f"{frequency:.0f} Hz"
+            )
+            label.setText(frequency_label)
+            label.setPos(frequency, peak_amplitudes[position])
+            label.show()
+
+    def keep_spectrum_y_zero(self, view_box, ranges):
+        y_minimum, y_maximum = ranges[1]
+        if y_minimum < 0 or y_minimum > 0:
+            view_box.setYRange(0, max(y_maximum, 1e-9), padding=0)
 
     def check_device_connection(self):
         address = viewer_address
@@ -1068,6 +1447,52 @@ class LivePlot(QtWidgets.QMainWindow):
 
     def mode_index(self):
         return self.mode_group.checkedId()
+
+    def save_mode_settings(self, mode):
+        self.mode_settings[mode] = {
+            "sample_rate": self.sample_rate_value(),
+            "capture_samples": self.capture_length_samples(),
+        }
+
+    def on_mode_changed(self, button, checked):
+        if not checked:
+            return
+        new_mode = self.mode_group.id(button)
+        if new_mode == self.active_settings_mode:
+            return
+
+        self.save_mode_settings(self.active_settings_mode)
+        self.active_settings_mode = new_mode
+        settings = self.mode_settings[new_mode]
+        sample_rate = settings["sample_rate"]
+        sample_rate_index = self.sample_rate.findData(sample_rate)
+        if sample_rate_index < 0:
+            raise ValueError(f"Unsupported saved sample rate: {sample_rate}")
+
+        for widget in (self.sample_rate, self.capture_length_ms):
+            widget.blockSignals(True)
+        try:
+            self.sample_rate.setCurrentIndex(sample_rate_index)
+            self.selected_sample_rate = sample_rate
+            self.capture_length_ms.setRange(
+                SAMPLE_BUFFER_SIZE / sample_rate * 1000,
+                MAX_CAPTURE_SAMPLES / sample_rate * 1000,
+            )
+            self.capture_length_ms.setSingleStep(
+                SAMPLE_BUFFER_SIZE / sample_rate * 1000
+            )
+            self.snapped_capture_length_samples = settings["capture_samples"]
+            self.capture_length_ms.setValue(
+                settings["capture_samples"] / sample_rate * 1000
+            )
+        finally:
+            self.capture_length_ms.blockSignals(False)
+            self.sample_rate.blockSignals(False)
+
+        self.refresh_acquisition_time_window()
+        self.refresh_trigger_line()
+        self.refresh_once_button()
+        self.send_settings()
 
     def trigger_repeat_index(self):
         return self.trigger_repeat_group.checkedId()
@@ -1098,16 +1523,11 @@ class LivePlot(QtWidgets.QMainWindow):
         sample_rate = self.sample_rate.currentData()
         if sample_rate is None:
             return
-        duration = HISTORY_SAMPLES / sample_rate
-        self.x_data = np.linspace(-duration, 0.0, self.history_samples)
+        self.snapped_capture_length_samples = None
         if self.last_raw_capture is None:
             self.history_sample_rate = (
                 sample_rate / self.client_average_factor()
             )
-        if not self.last_raw_capture and self.plot_view.currentIndex() == 0:
-            self.plot_widget.setXRange(-duration, 0.0)
-        elif self.last_raw_capture is None and self.plot_view.currentIndex() == 1:
-            self.update_spectrum()
         self.capture_length_ms.setRange(
             SAMPLE_BUFFER_SIZE / sample_rate * 1000,
             MAX_CAPTURE_SAMPLES / sample_rate * 1000,
@@ -1116,6 +1536,7 @@ class LivePlot(QtWidgets.QMainWindow):
             SAMPLE_BUFFER_SIZE / sample_rate * 1000
         )
         self.normalize_capture_length()
+        self.refresh_acquisition_time_window()
 
     def client_average_factor(self):
         return self.client_average.currentData()
@@ -1132,7 +1553,6 @@ class LivePlot(QtWidgets.QMainWindow):
 
     def refresh_client_average(self, *_):
         factor = self.client_average_factor()
-        self.history_samples = max(1, HISTORY_SAMPLES // factor)
         if self.last_raw_capture is not None:
             samples, buffer_capacity, overflows, trigger_index, sample_rate, \
                 transfer_seconds, payload_length = self.last_raw_capture
@@ -1141,19 +1561,23 @@ class LivePlot(QtWidgets.QMainWindow):
                 transfer_seconds, payload_length, new_capture=False,
             )
             return
+        self.history_samples = max(
+            1, self.capture_length_samples() // factor
+        )
         self.history = np.zeros(self.history_samples, dtype=np.uint16)
-        duration = HISTORY_SAMPLES / self.sample_rate_value()
+        duration = self.capture_length_samples() / self.sample_rate_value()
         self.x_data = np.linspace(-duration, 0.0, self.history_samples)
         self.history_sample_rate = (
             self.sample_rate_value() / factor
         )
-        if self.plot_view.currentIndex() == 0:
-            self.plot_widget.setXRange(-duration, 0.0)
+        self.refresh_acquisition_time_window()
         self.curve.setData(self.x_data, self.history)
         if self.plot_view.currentIndex() == 1:
             self.update_spectrum()
 
     def capture_length_samples(self):
+        if self.snapped_capture_length_samples is not None:
+            return self.snapped_capture_length_samples
         requested_samples = round(
             self.capture_length_ms.value() * self.sample_rate_value() / 1000
         )
@@ -1166,13 +1590,57 @@ class LivePlot(QtWidgets.QMainWindow):
         ) * SAMPLE_BUFFER_SIZE
 
     def normalize_capture_length(self):
+        samples = self.capture_length_samples()
+        self.snapped_capture_length_samples = samples
+        snapped_duration_ms = samples / self.sample_rate_value() * 1000
+        if abs(self.capture_length_ms.value() - snapped_duration_ms) >= 0.05:
+            self.normalizing_capture_length = True
+            try:
+                self.capture_length_ms.setValue(snapped_duration_ms)
+            finally:
+                self.normalizing_capture_length = False
+        self.save_mode_settings(self.active_settings_mode)
+
+    def on_capture_length_changed(self):
+        if self.normalizing_capture_length:
+            self.refresh_acquisition_time_window()
+            return
+        self.snapped_capture_length_samples = None
+        self.refresh_acquisition_time_window()
+        self.save_mode_settings(self.active_settings_mode)
+        self.send_settings()
+
+    def refresh_acquisition_time_window(self, *_):
         sample_rate = self.sample_rate_value()
-        actual_duration_ms = (
-            self.capture_length_samples() / sample_rate * 1000
-        )
-        if abs(self.capture_length_ms.value() - actual_duration_ms) > 1e-6:
-            self.capture_length_ms.setValue(actual_duration_ms)
-            self.send_settings()
+        capture_samples = self.capture_length_samples()
+        factor = self.client_average_factor()
+        self.history_samples = max(1, capture_samples // factor)
+        duration = capture_samples / sample_rate
+        if self.last_raw_capture is None:
+            if len(self.history) != self.history_samples:
+                retained = self.history[-self.history_samples:]
+                self.history = np.zeros(self.history_samples, dtype=np.uint16)
+                if len(retained):
+                    self.history[-len(retained):] = retained
+            self.x_data = np.linspace(
+                -duration, 0.0, self.history_samples
+            )
+            self.history_sample_rate = sample_rate / factor
+            self.curve.setData(self.x_data, self.history)
+            if self.plot_view.currentIndex() == 1:
+                self.update_spectrum()
+        else:
+            self.capture_view_initialized = False
+
+        if self.mode_index() == 1:
+            pretrigger = self.trigger_offset.value() / 100.0
+            self.plot_widget.setXRange(
+                -pretrigger * duration,
+                (1.0 - pretrigger) * duration,
+                padding=0,
+            )
+        else:
+            self.plot_widget.setXRange(-duration, 0.0, padding=0)
 
     def select_sample_rate(self, index):
         rate = self.sample_rate.itemData(index)
@@ -1200,6 +1668,7 @@ class LivePlot(QtWidgets.QMainWindow):
 
         self.selected_sample_rate = rate
         self.refresh_sample_rate()
+        self.save_mode_settings(self.active_settings_mode)
         self.send_settings()
 
     def sample_rate_value(self):
@@ -1255,8 +1724,13 @@ class LivePlot(QtWidgets.QMainWindow):
                 trigger_index
             ) / sample_rate
             self.plot_widget.setLabel("bottom", "Time from trigger", units="s")
-        self.plot_widget.setXRange(self.x_data[0], self.x_data[-1])
+        if not self.capture_view_initialized and len(self.x_data):
+            self.plot_widget.setXRange(self.x_data[0], self.x_data[-1])
+            self.capture_view_initialized = True
         self.curve.setData(self.x_data, self.history)
+        if new_capture:
+            self.record_autoscale_samples(averaged)
+        self.update_autoscale()
         if self.plot_view.currentIndex() == 1:
             self.update_spectrum()
 
@@ -1296,6 +1770,7 @@ class LivePlot(QtWidgets.QMainWindow):
                 )
                 capture_updated = True
         if capture_updated:
+            self.update_autoscale()
             return
 
         frames = []
@@ -1303,10 +1778,12 @@ class LivePlot(QtWidgets.QMainWindow):
             frames.append(frame_queue.get_nowait())
 
         if not frames:
+            self.update_autoscale()
             return
 
         new_data = np.concatenate(frames)
         new_data = self.average_for_display(new_data)
+        self.record_autoscale_samples(new_data)
         n = len(new_data)
         self.last_raw_capture = None
         self.history_sample_rate = (
@@ -1315,7 +1792,7 @@ class LivePlot(QtWidgets.QMainWindow):
 
         if len(self.history) != self.history_samples:
             self.history = np.zeros(self.history_samples, dtype=np.uint16)
-            duration = HISTORY_SAMPLES / self.sample_rate_value()
+            duration = self.capture_length_samples() / self.sample_rate_value()
             self.x_data = np.linspace(-duration, 0.0, self.history_samples)
             self.plot_widget.setXRange(-duration, 0.0)
         if n >= self.history_samples:
@@ -1325,6 +1802,7 @@ class LivePlot(QtWidgets.QMainWindow):
             self.history[-n:] = new_data
 
         self.curve.setData(self.x_data, self.history)
+        self.update_autoscale()
         if self.plot_view.currentIndex() == 1:
             self.update_spectrum()
 
@@ -1335,13 +1813,23 @@ class LivePlot(QtWidgets.QMainWindow):
         with stats_lock:
             current_frames = rx_frame_count
             current_bytes = rx_byte_count
+            current_rx_packets = rx_packet_count
+            current_rx_incomplete = rx_incomplete_count
+            current_tx_packets = device_tx_packet_count
+            current_tx_errors = device_tx_error_count
+            current_stream_blocks = device_stream_block_count
+            current_dma_drops = device_dma_drop_count
 
         d_frames = current_frames - self.last_frames
         d_bytes = current_bytes - self.last_bytes
+        d_rx_packets = current_rx_packets - self.last_rx_packets
+        if d_rx_packets < 0:
+            d_rx_packets = current_rx_packets
 
         self.last_time = now
         self.last_frames = current_frames
         self.last_bytes = current_bytes
+        self.last_rx_packets = current_rx_packets
 
         if dt > 0:
             fps = d_frames / dt
@@ -1351,11 +1839,17 @@ class LivePlot(QtWidgets.QMainWindow):
 
             duty_cycle = (effective_sps / self.sample_rate_value()) * 100.0
             mbps = (d_bytes * 8) / (dt * 1e6)
+            rx_packets_per_sec = d_rx_packets / dt
 
             msg = (
-                f"Sample Speed: {duty_cycle:.2f}% of {nominal_ksps:.0f} kSps  |  "
-                f"Rate: {effective_ksps:.1f} kS/s ({fps:.1f} FPS)  |  "
-                f"Network: {mbps:.2f} Mbps"
+                f"{duty_cycle:.1f}% of {nominal_ksps:.0f} kSps  |  "
+                f"{effective_ksps:.1f} kS/s ({fps:.0f} FPS)  |  "
+                f"{mbps:.2f} Mbps  |  "
+                f"TX ~1s {current_stream_blocks}blk "
+                f"{current_tx_packets}pkt {current_tx_errors}err  |  "
+                f"RX {rx_packets_per_sec:.0f} pkt/s, "
+                f"DMA drop {current_dma_drops}, "
+                f"{current_rx_incomplete} partial total"
             )
 
             self.status.showMessage(msg)

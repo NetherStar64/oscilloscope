@@ -50,6 +50,9 @@ enum class ViewerStatus : uint8_t {
     DmaOverflow = 2,
     TriggerOnceState = 3,
     SoftResetComplete = 4,
+    LivePacketsSent = 5,
+    LivePacketErrors = 6,
+    LiveBlocksProcessed = 7,
 };
 
 static void send_viewer_status(struct udp_pcb *status_conn,
@@ -537,6 +540,10 @@ void wifi_worker() {
     uint16_t latest_voltage_average = 0;
     bool have_voltage_average = false;
     uint32_t last_voltage_send_us = time_us_32();
+    uint32_t live_packets_sent = 0;
+    uint32_t live_packet_errors = 0;
+    uint32_t live_blocks_processed = 0;
+    uint32_t last_live_stats_send_us = time_us_32();
     while (true) {
         // Wait for new data
         queue_remove_blocking(&sample_fifo, &sample_buffer_index);
@@ -635,7 +642,7 @@ void wifi_worker() {
             for (u8_t i = 0; i < num_packets; i++) {
                 struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(udpsample), PBUF_RAM);
                 if (p == nullptr) {
-                    cyw43_arch_lwip_end();
+                    ++live_packet_errors;
                     break;
                 }
                 auto *pkt = static_cast<udpsample *>(p->payload);
@@ -645,12 +652,34 @@ void wifi_worker() {
                        SAMPLE_BUFFER_SPLIT * sizeof(uint16_t));
                 const err_t send_error = udp_send(udp_conn, p);
                 pbuf_free(p);
-                if (send_error != ERR_OK && send_error != ERR_MEM) {
+                if (send_error == ERR_OK) {
+                    ++live_packets_sent;
+                } else if (send_error == ERR_MEM) {
+                    ++live_packet_errors;
+                } else {
                     cyw43_arch_lwip_end();
                     panic("udp_send fail %d", send_error);
                 }
             }
             cyw43_arch_lwip_end();
+            ++live_blocks_processed;
+            const uint32_t stats_now_us = time_us_32();
+            if (static_cast<uint32_t>(stats_now_us - last_live_stats_send_us) >=
+                1000000u) {
+                send_viewer_status(
+                    status_conn, ViewerStatus::LivePacketsSent,
+                    live_packets_sent);
+                send_viewer_status(
+                    status_conn, ViewerStatus::LivePacketErrors,
+                    live_packet_errors);
+                send_viewer_status(
+                    status_conn, ViewerStatus::LiveBlocksProcessed,
+                    live_blocks_processed);
+                live_packets_sent = 0;
+                live_packet_errors = 0;
+                live_blocks_processed = 0;
+                last_live_stats_send_us = stats_now_us;
+            }
             ++sample_count;
             continue;
         }
