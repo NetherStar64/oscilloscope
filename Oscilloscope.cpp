@@ -23,6 +23,15 @@ static int trigger_led_alarm;
 static repeating_timer_t wifi_connect_timer;
 static bool wifi_connect_led_on = false;
 
+static void configure_adc_sample_rate(uint32_t sample_rate) {
+    const uint32_t adc_clock_hz = clock_get_hz(clk_adc);
+    const uint32_t maximum_sample_rate = adc_clock_hz / 96u;
+    const float divider = sample_rate >= maximum_sample_rate
+        ? 0.0f
+        : static_cast<float>(adc_clock_hz) / sample_rate - 1.0f;
+    adc_set_clkdiv(divider);
+}
+
 static bool blink_wifi_connect_led(repeating_timer_t *) {
     wifi_connect_led_on = !wifi_connect_led_on;
     gpio_put(LED_PIN, wifi_connect_led_on);
@@ -183,7 +192,7 @@ int main()
 
     // static void adc_fifo_setup (bool en, bool dreq_en, uint16_t dreq_thresh, bool err_in_fifo, bool byte_shift)
     adc_fifo_setup(true, true, 1, false, false);
-    adc_set_clkdiv(0); // Max speed 500 ksps
+    configure_adc_sample_rate(requested_sample_rate);
 
     adc_fifo_drain();
 
@@ -242,10 +251,7 @@ int main()
                 adc_gpio_init(26);
                 adc_select_input(0);
                 adc_fifo_setup(true, true, 1, false, false);
-                const float adc_clock_hz =
-                    static_cast<float>(clock_get_hz(clk_adc));
-                adc_set_clkdiv(
-                    adc_clock_hz / requested_sample_rate - 1.0f);
+                configure_adc_sample_rate(requested_sample_rate);
                 acquisition_init_reset_requested = false;
             }
             adc_fifo_drain();
@@ -259,8 +265,7 @@ int main()
         static uint32_t applied_sample_rate = 500000;
         const uint32_t sample_rate = requested_sample_rate;
         if (sample_rate != applied_sample_rate) {
-            const float adc_clock_hz = static_cast<float>(clock_get_hz(clk_adc));
-            adc_set_clkdiv(adc_clock_hz / sample_rate - 1.0f);
+            configure_adc_sample_rate(sample_rate);
             applied_sample_rate = sample_rate;
         }
 
