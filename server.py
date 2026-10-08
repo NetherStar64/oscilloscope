@@ -471,6 +471,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.history = np.zeros(self.history_samples, dtype=np.uint16)
         self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
         self.history_sample_rate = NOMINAL_ADC_SPS
+        self.live_effective_sample_rate = NOMINAL_ADC_SPS
         self.last_raw_capture = None
         self.capture_view_initialized = False
         self.snapped_capture_length_samples = None
@@ -1167,7 +1168,7 @@ class LivePlot(QtWidgets.QMainWindow):
         self.history = np.zeros(self.history_samples, dtype=np.uint16)
         self.x_data = np.linspace(-duration, 0.0, self.history_samples)
         self.history_sample_rate = (
-            NOMINAL_ADC_SPS / self.client_average_factor()
+            self.live_effective_sample_rate / self.client_average_factor()
         )
         if self.plot_view.currentIndex() == 0:
             self.plot_widget.setXRange(-duration, 0.0)
@@ -1489,6 +1490,7 @@ class LivePlot(QtWidgets.QMainWindow):
             self.capture_length_ms.blockSignals(False)
             self.sample_rate.blockSignals(False)
 
+        self.live_effective_sample_rate = sample_rate
         self.refresh_acquisition_time_window()
         self.refresh_trigger_line()
         self.refresh_once_button()
@@ -1523,6 +1525,7 @@ class LivePlot(QtWidgets.QMainWindow):
         sample_rate = self.sample_rate.currentData()
         if sample_rate is None:
             return
+        self.live_effective_sample_rate = sample_rate
         self.snapped_capture_length_samples = None
         if self.last_raw_capture is None:
             self.history_sample_rate = (
@@ -1568,7 +1571,7 @@ class LivePlot(QtWidgets.QMainWindow):
         duration = self.capture_length_samples() / self.sample_rate_value()
         self.x_data = np.linspace(-duration, 0.0, self.history_samples)
         self.history_sample_rate = (
-            self.sample_rate_value() / factor
+            self.live_effective_sample_rate / factor
         )
         self.refresh_acquisition_time_window()
         self.curve.setData(self.x_data, self.history)
@@ -1625,7 +1628,7 @@ class LivePlot(QtWidgets.QMainWindow):
             self.x_data = np.linspace(
                 -duration, 0.0, self.history_samples
             )
-            self.history_sample_rate = sample_rate / factor
+            self.history_sample_rate = self.live_effective_sample_rate / factor
             self.curve.setData(self.x_data, self.history)
             if self.plot_view.currentIndex() == 1:
                 self.update_spectrum()
@@ -1702,13 +1705,18 @@ class LivePlot(QtWidgets.QMainWindow):
                         sample_rate, transfer_seconds, payload_length,
                         new_capture=True):
         sample_rate = sample_rate or self.sample_rate_value()
+        effective_sample_rate = sample_rate
+        if overflows:
+            effective_sample_rate *= len(samples) / (
+                len(samples) + overflows * SAMPLE_BUFFER_SIZE
+            )
         factor = self.client_average_factor()
         averaged = self.average_for_display(samples)
         self.last_capture_length = len(samples)
         self.last_capture_overflows = overflows
         self.last_capture_seconds = transfer_seconds
         self.history = averaged
-        self.history_sample_rate = sample_rate / factor
+        self.history_sample_rate = effective_sample_rate / factor
         displayed_trigger_index = (
             (trigger_index - (factor - 1) / 2) / factor
             if trigger_index != 0xFFFFFFFF else None
@@ -1716,13 +1724,13 @@ class LivePlot(QtWidgets.QMainWindow):
         if displayed_trigger_index is None:
             self.x_data = (
                 np.arange(len(averaged)) * factor + (factor - 1) / 2
-            ) / sample_rate
+            ) / effective_sample_rate
             self.plot_widget.setLabel("bottom", "Sample time", units="s")
         else:
             self.x_data = (
                 np.arange(len(averaged)) * factor + (factor - 1) / 2 -
                 trigger_index
-            ) / sample_rate
+            ) / effective_sample_rate
             self.plot_widget.setLabel("bottom", "Time from trigger", units="s")
         if not self.capture_view_initialized and len(self.x_data):
             self.plot_widget.setXRange(self.x_data[0], self.x_data[-1])
@@ -1787,7 +1795,7 @@ class LivePlot(QtWidgets.QMainWindow):
         n = len(new_data)
         self.last_raw_capture = None
         self.history_sample_rate = (
-            self.sample_rate_value() / self.client_average_factor()
+            self.live_effective_sample_rate / self.client_average_factor()
         )
 
         if len(self.history) != self.history_samples:
@@ -1840,6 +1848,10 @@ class LivePlot(QtWidgets.QMainWindow):
             duty_cycle = (effective_sps / self.sample_rate_value()) * 100.0
             mbps = (d_bytes * 8) / (dt * 1e6)
             rx_packets_per_sec = d_rx_packets / dt
+            if self.mode_index() == 0 and d_frames > 0:
+                self.live_effective_sample_rate = min(
+                    self.sample_rate_value(), effective_sps
+                )
 
             msg = (
                 f"{duty_cycle:.1f}% of {nominal_ksps:.0f} kSps  |  "
