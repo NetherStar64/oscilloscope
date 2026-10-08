@@ -6,6 +6,7 @@
 #include "config.h"
 #include "wifipassword.h"
 #include "pico/util/queue.h"
+#include "hardware/watchdog.h"
 #include "hardware/clocks.h"
 #include "lwip/udp.h"
 #include "lwip/tcp.h"
@@ -29,15 +30,26 @@ volatile uint32_t requested_capture_length = NUM_RING_BUFFERS * SAMPLE_BUFFER_SI
 volatile uint8_t trigger_offset_percent = 50;
 volatile bool acquisition_pause_requested = false;
 volatile bool acquisition_paused = false;
+volatile bool acquisition_stats_reset_requested = false;
+volatile bool acquisition_init_reset_requested = false;
+volatile bool soft_reset_requested = false;
 
 #define CONTROL_PORT 4445
 #define CAPTURE_PORT 4446
 #define STATUS_PORT 4447
+#define VOLTAGE_PORT 4448
+
+static_assert(ADC_VOLTAGE_AVERAGE_SAMPLES > 0 &&
+              ADC_VOLTAGE_AVERAGE_SAMPLES <= UINT16_MAX,
+              "ADC voltage averaging window must fit the UDP protocol");
+static_assert(ADC_VOLTAGE_STREAM_HZ > 0,
+              "ADC voltage stream frequency must be positive");
 
 enum class ViewerStatus : uint8_t {
     TriggerHit = 1,
     DmaOverflow = 2,
     TriggerOnceState = 3,
+    SoftResetComplete = 4,
 };
 
 static void send_viewer_status(struct udp_pcb *status_conn,
@@ -56,6 +68,30 @@ static void send_viewer_status(struct udp_pcb *status_conn,
         }
     } else {
         printf("Viewer status UDP packet allocation failed\n");
+    }
+    cyw43_arch_lwip_end();
+}
+
+static void send_voltage_reading(struct udp_pcb *voltage_conn,
+                                 uint16_t average) {
+    const uint8_t message[8] = {
+        'O', 'S', 'C', 'V',
+        static_cast<uint8_t>(average & 0xff),
+        static_cast<uint8_t>(average >> 8),
+        static_cast<uint8_t>(ADC_VOLTAGE_AVERAGE_SAMPLES & 0xff),
+        static_cast<uint8_t>(ADC_VOLTAGE_AVERAGE_SAMPLES >> 8),
+    };
+    cyw43_arch_lwip_begin();
+    struct pbuf *packet = pbuf_alloc(PBUF_TRANSPORT, sizeof(message), PBUF_RAM);
+    if (packet == nullptr) {
+        printf("Voltage UDP packet allocation failed\n");
+    } else {
+        memcpy(packet->payload, message, sizeof(message));
+        const err_t result = udp_send(voltage_conn, packet);
+        pbuf_free(packet);
+        if (result != ERR_OK) {
+            printf("Voltage UDP send failed: %d\n", result);
+        }
     }
     cyw43_arch_lwip_end();
 }
@@ -400,6 +436,15 @@ static void control_received(void *, struct udp_pcb *, struct pbuf *packet,
     command[length] = '\0';
     pbuf_free(packet);
 
+    if (length == 4 && memcmp(command, "OSCR", 4) == 0) {
+        soft_reset_requested = true;
+        return;
+    }
+    if (length == 4 && memcmp(command, "OSCH", 4) == 0) {
+        watchdog_reboot(0, 0, 0);
+        return;
+    }
+
     unsigned mode, rate, edge, continuous, capture_length, offset_percent;
     float voltage;
     const uint32_t minimum_sample_rate =
@@ -457,6 +502,17 @@ void wifi_worker() {
         udp_connect(status_conn, &viewer, STATUS_PORT) != ERR_OK) {
         panic("Failed to start viewer status socket");
     }
+    auto *voltage_conn = udp_new();
+    if (voltage_conn == nullptr) {
+        panic("Failed to start voltage UDP socket: UDP PCB pool exhausted");
+    }
+    const err_t voltage_connect_error =
+        udp_connect(voltage_conn, &viewer, VOLTAGE_PORT);
+    if (voltage_connect_error != ERR_OK) {
+        udp_remove(voltage_conn);
+        panic("Failed to connect voltage UDP socket: %d",
+              voltage_connect_error);
+    }
 
     printf("Connected to UDP socket\n");
     cyw43_arch_lwip_end();
@@ -476,9 +532,54 @@ void wifi_worker() {
     uint32_t capture_overflow_start = 0;
     uint32_t last_notified_overflow_count = overflow_count;
     uint32_t observed_generation = control_generation;
+    uint32_t voltage_sum = 0;
+    uint32_t voltage_sample_count = 0;
+    uint16_t latest_voltage_average = 0;
+    bool have_voltage_average = false;
+    uint32_t last_voltage_send_us = time_us_32();
     while (true) {
         // Wait for new data
         queue_remove_blocking(&sample_fifo, &sample_buffer_index);
+        if (soft_reset_requested) {
+            soft_reset_requested = false;
+            set_acquisition_paused(true);
+            close_capture_tcp(capture_connection);
+            memset(sample_buffers, 0, sizeof(sample_buffers));
+            capture_mode = CaptureMode::Stream;
+            trigger_edge = TriggerEdge::Rising;
+            trigger_continuous = false;
+            trigger_level = 2048;
+            requested_sample_rate = 500000;
+            requested_capture_length =
+                NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE;
+            trigger_offset_percent = 50;
+            ++control_generation;
+            observed_generation = control_generation;
+            once_armed = true;
+            capture_active = false;
+            have_previous_sample = false;
+            previous_sample = 0;
+            pretrigger_size = 0;
+            pretrigger_write_index = 0;
+            capture_size = 0;
+            capture_sample_rate = requested_sample_rate;
+            capture_trigger_index = UINT32_MAX;
+            capture_overflow_start = 0;
+            voltage_sum = 0;
+            voltage_sample_count = 0;
+            latest_voltage_average = 0;
+            have_voltage_average = false;
+            acquisition_stats_reset_requested = true;
+            while (acquisition_stats_reset_requested) {
+                sleep_ms(1);
+            }
+            last_notified_overflow_count = 0;
+            acquisition_init_reset_requested = true;
+            set_acquisition_paused(false);
+            send_viewer_status(
+                status_conn, ViewerStatus::SoftResetComplete, 0);
+            continue;
+        }
         // Memcopy for no tear
         memcpy(
             sample_buffer_copy,
@@ -506,6 +607,25 @@ void wifi_worker() {
             send_viewer_status(
                 status_conn, ViewerStatus::TriggerOnceState,
                 mode == CaptureMode::Trigger && !trigger_continuous ? 1 : 0);
+        }
+
+        for (uint16_t sample : sample_buffer_copy) {
+            voltage_sum += sample;
+            if (++voltage_sample_count == ADC_VOLTAGE_AVERAGE_SAMPLES) {
+                latest_voltage_average = static_cast<uint16_t>(
+                    (voltage_sum + ADC_VOLTAGE_AVERAGE_SAMPLES / 2) /
+                    ADC_VOLTAGE_AVERAGE_SAMPLES);
+                voltage_sum = 0;
+                voltage_sample_count = 0;
+                have_voltage_average = true;
+            }
+        }
+        const uint32_t now_us = time_us_32();
+        if (have_voltage_average &&
+            static_cast<uint32_t>(now_us - last_voltage_send_us) >=
+                1000000u / ADC_VOLTAGE_STREAM_HZ) {
+            send_voltage_reading(voltage_conn, latest_voltage_average);
+            last_voltage_send_us = now_us;
         }
 
         if (mode == CaptureMode::Stream) {

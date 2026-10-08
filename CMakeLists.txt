@@ -50,6 +50,7 @@ target_link_libraries(Oscilloscope
         hardware_adc
         hardware_dma
         hardware_pwm
+        hardware_watchdog
         pico_multicore)
 
 # Add the standard include files to the build
@@ -63,4 +64,3 @@ target_link_libraries(Oscilloscope
         )
 
 pico_add_extra_outputs(Oscilloscope)
-

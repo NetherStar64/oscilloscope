@@ -7,6 +7,7 @@
 // Memory settings
 #define MEM_ALIGNMENT               4
 #define MEM_SIZE                    65536
+#define MEMP_NUM_UDP_PCB             6
 #define MEMP_NUM_TCP_SEG            192
 #define MEMP_NUM_ARP_QUEUE          10
 #define PBUF_POOL_SIZE              32

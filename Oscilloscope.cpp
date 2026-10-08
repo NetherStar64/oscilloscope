@@ -8,6 +8,7 @@
 #include "hardware/pwm.h"
 #include "pico/multicore.h"
 #include "hardware/irq.h"
+#include "pico/time.h"
 #include <malloc.h>
 #include "pico/util/queue.h"
 
@@ -19,6 +20,14 @@
 #define PWM_PIN 2
 
 static int trigger_led_alarm;
+static repeating_timer_t wifi_connect_timer;
+static bool wifi_connect_led_on = false;
+
+static bool blink_wifi_connect_led(repeating_timer_t *) {
+    wifi_connect_led_on = !wifi_connect_led_on;
+    gpio_put(LED_PIN, wifi_connect_led_on);
+    return true;
+}
 
 static void turn_off_trigger_led(uint) {
     gpio_put(LED_PIN, 0);
@@ -87,8 +96,13 @@ int main()
     printf("\n=====================\n");
     printf("Init Oscilloscope\n");
 
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    gpio_put(LED_PIN, 0);
     cyw43_arch_init_with_country(WIFI_COUNTRY);
     cyw43_arch_enable_sta_mode();
+    add_repeating_timer_ms(250, blink_wifi_connect_led, nullptr,
+                           &wifi_connect_timer);
 
     int res = -1;
     for (int i = 0; i<3; i++) {
@@ -104,12 +118,12 @@ int main()
         panic("Didn't connect to Wifi %d\n", res);
     }
 
+    cancel_repeating_timer(&wifi_connect_timer);
+    wifi_connect_led_on = false;
+    gpio_put(LED_PIN, 0);
     cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
 
 
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 0);
     trigger_led_alarm = hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(trigger_led_alarm, turn_off_trigger_led);
 
@@ -194,6 +208,12 @@ int main()
     uint32_t lastoverflowcount = 0;
     
     while (true) {
+        if (acquisition_stats_reset_requested) {
+            overflow_count = 0;
+            procO = 0;
+            lastoverflowcount = 0;
+            acquisition_stats_reset_requested = false;
+        }
         if (acquisition_pause_requested && !acquisition_stopped) {
             irq_set_enabled(DMA_IRQ_0, false);
             adc_run(false);
@@ -217,6 +237,17 @@ int main()
             acquisition_stopped = true;
             acquisition_paused = true;
         } else if (!acquisition_pause_requested && acquisition_stopped) {
+            if (acquisition_init_reset_requested) {
+                adc_init();
+                adc_gpio_init(26);
+                adc_select_input(0);
+                adc_fifo_setup(true, true, 1, false, false);
+                const float adc_clock_hz =
+                    static_cast<float>(clock_get_hz(clk_adc));
+                adc_set_clkdiv(
+                    adc_clock_hz / requested_sample_rate - 1.0f);
+                acquisition_init_reset_requested = false;
+            }
             adc_fifo_drain();
             irq_set_enabled(DMA_IRQ_0, true);
             dma_channel_start(dma_chan0);

@@ -29,3 +29,6 @@ extern volatile uint32_t requested_capture_length;
 extern volatile uint8_t trigger_offset_percent;
 extern volatile bool acquisition_pause_requested;
 extern volatile bool acquisition_paused;
+extern volatile bool acquisition_stats_reset_requested;
+extern volatile bool acquisition_init_reset_requested;
+extern volatile bool soft_reset_requested;
