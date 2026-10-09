@@ -33,6 +33,15 @@ project(Oscilloscope C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
+# Let USB CDC queue several live sample blocks while the host drains them.
+# Full-speed endpoint packets remain 64 bytes; this only reduces firmware-side
+# backpressure between packets.
+if(TARGET tinyusb_device_base)
+    target_compile_definitions(tinyusb_device_base INTERFACE
+            CFG_TUD_CDC_TX_BUFSIZE=16384
+    )
+endif()
+
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(Oscilloscope Oscilloscope.cpp core1_worker.cpp)

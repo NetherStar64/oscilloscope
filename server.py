@@ -37,7 +37,7 @@ AUTOSCALE_WINDOW_SECONDS = 1.0
 AUTOSCALE_SMOOTHING_SECONDS = 1.0
 
 # 3.3V ADC Max + 1/2 Voltage divider -> VSCALE = Voltage at Max ADC
-VSCALE = 3.3 / (1/2)
+VSCALE = 3.3
 
 READOUT_CARD_STYLE = """
     QFrame {

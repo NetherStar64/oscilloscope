@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "pico/stdio_usb.h"
 #include "pico/multicore.h"
+#include "tusb.h"
 #include "core1_worker.h"
 #include "config.h"
 #include "pico/util/queue.h"
@@ -62,8 +63,34 @@ static bool write_usb_bytes(const void *bytes, size_t length) {
     if (!stdio_usb_connected()) {
         return false;
     }
-    stdio_put_string(static_cast<const char *>(bytes),
-                     static_cast<int>(length), false, false);
+    const auto *data = static_cast<const uint8_t *>(bytes);
+    size_t offset = 0;
+    uint32_t last_progress_us = time_us_32();
+    while (offset < length) {
+        if (!stdio_usb_connected()) {
+            return false;
+        }
+        const uint32_t available = tud_cdc_write_available();
+        if (available == 0) {
+            tud_cdc_write_flush();
+            if (static_cast<uint32_t>(time_us_32() - last_progress_us) >
+                500000u) {
+                return false;
+            }
+            tight_loop_contents();
+            continue;
+        }
+        const uint32_t chunk_length = static_cast<uint32_t>(
+            std::min<size_t>(length - offset, available));
+        const uint32_t written =
+            tud_cdc_write(data + offset, chunk_length);
+        if (written == 0) {
+            continue;
+        }
+        offset += written;
+        last_progress_us = time_us_32();
+    }
+    tud_cdc_write_flush();
     return true;
 }
 
