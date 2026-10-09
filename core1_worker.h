@@ -1,11 +1,8 @@
-#include <stdio.h>
-#include "pico/cyw43_arch.h"
-
-
 #pragma once
 #include <stdint.h>
 
-void wifi_worker();
+void usb_worker();
+void process_usb_control();
 void flash_trigger_led();
 
 enum class CaptureMode : uint8_t {

@@ -1,0 +1,5 @@
+numpy
+pyqtgraph
+PyQt6
+pyserial
+scipy>=1.10

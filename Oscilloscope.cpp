@@ -4,7 +4,6 @@
 #include "hardware/adc.h"
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
-#include "pico/cyw43_arch.h"
 #include "hardware/pwm.h"
 #include "pico/multicore.h"
 #include "hardware/irq.h"
@@ -14,14 +13,11 @@
 
 #include "core1_worker.h"
 #include "config.h"
-#include "wifipassword.h"
 
 #define LED_PIN 16
 #define PWM_PIN 2
 
 static int trigger_led_alarm;
-static repeating_timer_t wifi_connect_timer;
-static bool wifi_connect_led_on = false;
 
 static void configure_adc_sample_rate(uint32_t sample_rate) {
     const uint32_t adc_clock_hz = clock_get_hz(clk_adc);
@@ -30,12 +26,6 @@ static void configure_adc_sample_rate(uint32_t sample_rate) {
         ? 0.0f
         : static_cast<float>(adc_clock_hz) / sample_rate - 1.0f;
     adc_set_clkdiv(divider);
-}
-
-static bool blink_wifi_connect_led(repeating_timer_t *) {
-    wifi_connect_led_on = !wifi_connect_led_on;
-    gpio_put(LED_PIN, wifi_connect_led_on);
-    return true;
 }
 
 static void turn_off_trigger_led(uint) {
@@ -69,7 +59,7 @@ static int dma_chan0;
 static int dma_chan1;
 static bool acquisition_stopped = false;
 
-void dma_irq_handle_channel(int dma_chan_finished, u8_t finished_buf) {
+void dma_irq_handle_channel(int dma_chan_finished, uint8_t finished_buf) {
     if (queue_try_add(&sample_fifo, &finished_buf)) {
         // :)
     } else {
@@ -102,37 +92,10 @@ void dma_irq_handler()  {
 int main()
 {
     stdio_init_all();
-    printf("\n=====================\n");
-    printf("Init Oscilloscope\n");
 
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
     gpio_put(LED_PIN, 0);
-    cyw43_arch_init_with_country(WIFI_COUNTRY);
-    cyw43_arch_enable_sta_mode();
-    add_repeating_timer_ms(250, blink_wifi_connect_led, nullptr,
-                           &wifi_connect_timer);
-
-    int res = -1;
-    for (int i = 0; i<3; i++) {
-        res = cyw43_arch_wifi_connect_timeout_ms(SSID, WIFI_PASS, WIFI_SECURITY, 10000);
-        if (res == 0) {
-            printf("We got da WiFi\n");
-            break;
-        }
-        printf("Wifi connect %d failed, retry\n", i);
-        sleep_ms(2000);
-    }
-    if (res != 0) {
-        panic("Didn't connect to Wifi %d\n", res);
-    }
-
-    cancel_repeating_timer(&wifi_connect_timer);
-    wifi_connect_led_on = false;
-    gpio_put(LED_PIN, 0);
-    cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
-
-
     trigger_led_alarm = hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(trigger_led_alarm, turn_off_trigger_led);
 
@@ -168,7 +131,7 @@ int main()
     queue_init(&sample_fifo, sizeof(uint8_t), NUM_RING_BUFFERS);
 
 //     multicore_reset_core1();
-    multicore_launch_core1(wifi_worker);
+    multicore_launch_core1(usb_worker);
 
     dma_chan0 = dma_claim_unused_channel(true);
     dma_chan1 = dma_claim_unused_channel(true);
@@ -212,15 +175,10 @@ int main()
     dma_channel_start(dma_chan0);
     adc_run(true);
 
-    uint32_t procO = 0;
-    uint32_t lastprint1 = time_us_32();
-    uint32_t lastoverflowcount = 0;
-    
     while (true) {
+        process_usb_control();
         if (acquisition_stats_reset_requested) {
             overflow_count = 0;
-            procO = 0;
-            lastoverflowcount = 0;
             acquisition_stats_reset_requested = false;
         }
         if (acquisition_pause_requested && !acquisition_stopped) {
@@ -269,25 +227,6 @@ int main()
             applied_sample_rate = sample_rate;
         }
 
-        if (procO < overflow_count) {
-            if (overflow_count-procO > 5) {
-                printf("X");
-            } else {
-                for (int i = 0; i<(overflow_count-procO); i++) {
-                    printf("O");
-                }
-            }
-            procO = overflow_count;
-        }
-        const uint32_t now_us = time_us_32();
-        if ((now_us - lastprint1) > 1000000) {
-            // once per second
-            if (lastoverflowcount < overflow_count) {
-                printf("\n%u Overflows\n", (overflow_count-lastoverflowcount));
-                lastoverflowcount = overflow_count;
-            }
-            lastprint1 = now_us;
-        }
         sleep_ms(1000/120);
     }
 

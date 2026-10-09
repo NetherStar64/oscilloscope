@@ -40,9 +40,9 @@ add_executable(Oscilloscope Oscilloscope.cpp core1_worker.cpp)
 pico_set_program_name(Oscilloscope "Oscilloscope")
 pico_set_program_version(Oscilloscope "0.1")
 
-# Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(Oscilloscope 1)
-pico_enable_stdio_usb(Oscilloscope 0)
+# Use the Pico's native USB connection for the oscilloscope data stream.
+pico_enable_stdio_uart(Oscilloscope 0)
+pico_enable_stdio_usb(Oscilloscope 1)
 
 # Add the standard library to the build
 target_link_libraries(Oscilloscope
@@ -57,10 +57,5 @@ target_link_libraries(Oscilloscope
 target_include_directories(Oscilloscope PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
 )
-
-# Add any user requested libraries
-target_link_libraries(Oscilloscope 
-        pico_cyw43_arch_lwip_threadsafe_background
-        )
 
 pico_add_extra_outputs(Oscilloscope)

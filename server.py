@@ -1,4 +1,4 @@
-import socket
+import os
 import struct
 import threading
 import queue
@@ -7,19 +7,22 @@ import contextlib
 from collections import deque
 import numpy as np
 import pyqtgraph as pg
+import serial
+from scipy import signal
+from serial.tools import list_ports
 from PyQt6 import QtCore, QtWidgets
 
-PORT = 4444
-CONTROL_PORT = 4445
-CAPTURE_PORT = 4446
-STATUS_PORT = 4447
-VOLTAGE_PORT = 4448
+USB_FRAME_MAGIC = b"OSCF"
+USB_FRAME_HEADER_SIZE = 9
+USB_FRAME_LIVE = 1
+USB_FRAME_CAPTURE = 2
+USB_FRAME_STATUS = 3
+USB_FRAME_VOLTAGE = 4
+SERIAL_BAUD_RATE = 115200
+SERIAL_RETRY_SEC = 2.0
 STATUS_FLASH_MIN_INTERVAL = 1 / 60
 STATUS_FLASH_DURATION_MS = 100
 TOTAL_SAMPLES = 1024
-SAMPLES_PER_PACKET = 512
-NUM_PARTS = TOTAL_SAMPLES // SAMPLES_PER_PACKET
-UDP_FRAME_EXPIRY_SEC = 0.25
 NUM_RING_BUFFERS = 84
 SAMPLE_BUFFER_SIZE = 1024
 MAX_CAPTURE_SAMPLES = NUM_RING_BUFFERS * SAMPLE_BUFFER_SIZE
@@ -58,9 +61,9 @@ device_stream_block_count = 0
 device_dma_drop_count = 0
 viewer_address = None
 worker_stop = threading.Event()
-worker_socket_lock = threading.Lock()
-worker_sockets = set()
 worker_threads = []
+serial_lock = threading.Lock()
+serial_connection = None
 device_seen_lock = threading.Lock()
 last_device_seen_signal = 0.0
 
@@ -111,21 +114,6 @@ class ScopeAxisItem(pg.AxisItem):
         else:
             event.ignore()
 
-def register_worker_socket(sock):
-    with worker_socket_lock:
-        if worker_stop.is_set():
-            sock.close()
-            raise OSError("Viewer is shutting down")
-        worker_sockets.add(sock)
-
-def close_worker_socket(sock):
-    if sock is None:
-        return
-    with worker_socket_lock:
-        worker_sockets.discard(sock)
-    with contextlib.suppress(OSError):
-        sock.close()
-
 def report_worker_error(worker_name, error):
     if not worker_stop.is_set():
         status_events.worker_error.emit(f"{worker_name} failed: {error}")
@@ -140,121 +128,10 @@ def notify_device_seen(address):
         last_device_seen_signal = now
     status_events.device_seen.emit(address)
 
-def udp_worker():
-    global rx_frame_count, rx_byte_count, rx_packet_count, rx_incomplete_count
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", PORT))
-        sock.settimeout(0.5)
-        register_worker_socket(sock)
-        frames = {}
-        frame_first_seen = {}
-
-        while not worker_stop.is_set():
-            try:
-                packet, sender = sock.recvfrom(2048)
-            except socket.timeout:
-                continue
-            if len(packet) < 5 + SAMPLES_PER_PACKET * 2:
-                continue
-            sample_count, sample_part = struct.unpack_from("<IB", packet, 0)
-            if sample_part >= NUM_PARTS:
-                continue
-            notify_device_seen(sender[0])
-            received_at = time.monotonic()
-            data_offset = len(packet) - (SAMPLES_PER_PACKET * 2)
-            samples = np.frombuffer(
-                packet, dtype=np.uint16, offset=data_offset,
-                count=SAMPLES_PER_PACKET
-            )
-
-            expired_frames = [
-                count for count, first_seen in frame_first_seen.items()
-                if received_at - first_seen > UDP_FRAME_EXPIRY_SEC
-            ]
-            if sample_count not in frames and len(frames) >= 20:
-                expired_frames.append(min(frames))
-            if expired_frames:
-                expired_frames = set(expired_frames)
-                with stats_lock:
-                    rx_incomplete_count += len(expired_frames)
-                for count in expired_frames:
-                    frames.pop(count, None)
-                    frame_first_seen.pop(count, None)
-
-            with stats_lock:
-                rx_packet_count += 1
-                rx_byte_count += len(packet)
-            if sample_count not in frames:
-                frames[sample_count] = {}
-                frame_first_seen[sample_count] = received_at
-            frames[sample_count][sample_part] = samples
-
-            if len(frames[sample_count]) == NUM_PARTS:
-                full_frame = np.concatenate(
-                    [frames[sample_count][part] for part in range(NUM_PARTS)]
-                )
-                del frames[sample_count]
-                frame_first_seen.pop(sample_count, None)
-                with stats_lock:
-                    rx_frame_count += 1
-                if frame_queue.full():
-                    with contextlib.suppress(queue.Empty):
-                        frame_queue.get_nowait()
-                frame_queue.put(full_frame)
-    except OSError as error:
-        report_worker_error("Sample UDP listener", error)
-    finally:
-        close_worker_socket(sock)
-
-def recv_exact(connection, length):
-    data = bytearray(length)
-    view = memoryview(data)
-    offset = 0
-    while offset < length:
-        try:
-            received = connection.recv_into(view[offset:], length - offset)
-        except socket.timeout:
-            if worker_stop.is_set():
-                return None
-            continue
-        if not received:
-            return None
-        offset += received
-    return data
-
-def recv_samples(connection, sample_count):
-    samples = np.empty(sample_count, dtype="<u2")
-    payload = memoryview(samples).cast("B")
-    offset = 0
-    while offset < len(payload):
-        try:
-            received = connection.recv_into(payload[offset:], len(payload) - offset)
-        except socket.timeout:
-            if worker_stop.is_set():
-                return None
-            continue
-        if not received:
-            return None
-        offset += received
-    return samples
-
-def recv_packed_samples(connection, sample_count):
+def unpack_packed_samples(packed, sample_count):
     payload_length = (sample_count // 2) * 3 + (sample_count % 2) * 2
-    packed = bytearray(payload_length)
-    view = memoryview(packed)
-    offset = 0
-    while offset < payload_length:
-        try:
-            received = connection.recv_into(view[offset:], payload_length - offset)
-        except socket.timeout:
-            if worker_stop.is_set():
-                return None
-            continue
-        if not received:
-            return None
-        offset += received
+    if len(packed) != payload_length:
+        raise ValueError("Invalid packed sample payload length")
 
     samples = np.empty(sample_count, dtype="<u2")
     pairs = sample_count // 2
@@ -267,143 +144,165 @@ def recv_packed_samples(connection, sample_count):
         samples[-1] = packed[-2] | (packed[-1] << 8)
     return samples
 
-def tcp_capture_worker():
-    server = None
-    try:
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-        server.bind(("0.0.0.0", CAPTURE_PORT))
-        server.listen()
-        server.settimeout(0.5)
-        register_worker_socket(server)
+def find_serial_port():
+    configured_port = os.environ.get("OSCILLOSCOPE_PORT")
+    if configured_port:
+        return configured_port
+    pico_ports = [
+        port.device for port in list_ports.comports()
+        if port.vid == 0x2E8A and port.pid in (0x0009, 0x000A)
+    ]
+    if len(pico_ports) == 1:
+        return pico_ports[0]
+    if not pico_ports:
+        raise OSError(
+            "No Raspberry Pi USB serial device found; connect the Pico's USB "
+            "port or set OSCILLOSCOPE_PORT to its COM port."
+        )
+    raise OSError(
+        "Multiple Raspberry Pi USB serial devices found; set "
+        "OSCILLOSCOPE_PORT to the Pico's COM port."
+    )
 
-        while not worker_stop.is_set():
-            try:
-                connection, _ = server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                if worker_stop.is_set():
-                    break
-                raise
-            try:
-                connection.settimeout(0.5)
-                register_worker_socket(connection)
-                with connection:
-                    handle_capture_connection(connection)
-            except OSError as error:
-                if not worker_stop.is_set():
-                    capture_queue.put(
-                        (None, 0, 0, None, 0, 0.0, 0,
-                         f"Capture TCP connection reset: {error}")
-                    )
-            finally:
-                close_worker_socket(connection)
-    except OSError as error:
-        report_worker_error("Capture TCP listener", error)
-    finally:
-        close_worker_socket(server)
+def serial_read_exact(connection, length):
+    data = bytearray()
+    while len(data) < length and not worker_stop.is_set():
+        chunk = connection.read(length - len(data))
+        if chunk:
+            data.extend(chunk)
+    return bytes(data) if len(data) == length else None
 
-def handle_capture_connection(connection):
+def serial_read_frame_header(connection):
+    buffered = bytearray(
+        serial_read_exact(connection, USB_FRAME_HEADER_SIZE) or b""
+    )
+    if len(buffered) != USB_FRAME_HEADER_SIZE:
+        return None
+    if buffered.startswith(USB_FRAME_MAGIC):
+        return bytes(buffered)
     while not worker_stop.is_set():
-        transfer_started = time.perf_counter()
-        prefix = recv_exact(connection, 4)
-        if prefix is None:
-            break
-        if prefix == b"OS13":
-            header_size = 20
-        elif prefix in (b"OSCP", b"OS12"):
-            header_size = 16
-        else:
-            capture_queue.put(
-                (None, 0, 0, None, 0, 0.0, 0,
-                 "Invalid capture header from oscilloscope")
-            )
-            break
-        header_tail = recv_exact(connection, header_size)
-        if header_tail is None:
-            if not worker_stop.is_set():
-                capture_queue.put(
-                    (None, 0, 0, None, 0, 0.0, 0,
-                     "Incomplete TCP capture header")
-                )
-            break
-        header = prefix + header_tail
-        if prefix == b"OS13":
-            (magic, sample_count, buffer_capacity, overflow_count,
-             trigger_index, sample_rate) = struct.unpack("<4sIIIII", header)
-        else:
-            (magic, sample_count, buffer_capacity, overflow_count,
-             trigger_index) = struct.unpack("<4sIIII", header)
-            sample_rate = 0
-        if (
-            not SAMPLE_BUFFER_SIZE <= buffer_capacity <= MAX_CAPTURE_SAMPLES
-            or sample_count > buffer_capacity
-            or (sample_count and trigger_index != 0xFFFFFFFF
-                and trigger_index >= sample_count)
-            or (magic == b"OS13" and
-                not 8 <= sample_rate <= NOMINAL_ADC_SPS)
-        ):
-            capture_queue.put(
-                (None, 0, 0, None, 0, 0.0, 0,
-                 "Invalid capture header from oscilloscope")
-            )
-            break
+        marker_index = buffered.find(USB_FRAME_MAGIC)
+        if marker_index >= 0:
+            header_bytes = buffered[marker_index:]
+            remaining_length = USB_FRAME_HEADER_SIZE - len(header_bytes)
+            if remaining_length > 0:
+                remainder = serial_read_exact(connection, remaining_length)
+                if remainder is None:
+                    return None
+                header_bytes.extend(remainder)
+            return bytes(header_bytes[:USB_FRAME_HEADER_SIZE])
+        buffered = buffered[-(len(USB_FRAME_MAGIC) - 1):]
+        next_byte = serial_read_exact(connection, 1)
+        if next_byte is None:
+            return None
+        buffered.extend(next_byte)
+    return None
 
-        if sample_count == 0:
-            capture_queue.put(
-                (None, buffer_capacity, overflow_count, trigger_index,
-                 sample_rate, 0.0, 0, None)
-            )
-            continue
+def handle_live_frame(payload):
+    global rx_frame_count
+    if len(payload) != 4 + (TOTAL_SAMPLES * 3 // 2):
+        raise ValueError("Invalid live sample frame size")
+    sample_count = struct.unpack_from("<I", payload)[0]
+    samples = unpack_packed_samples(payload[4:], TOTAL_SAMPLES)
+    with stats_lock:
+        rx_frame_count += 1
+    if frame_queue.full():
+        with contextlib.suppress(queue.Empty):
+            frame_queue.get_nowait()
+    frame_queue.put(samples)
 
-        payload_length = (
-            (sample_count // 2) * 3 + (sample_count % 2) * 2
-            if magic in (b"OS12", b"OS13") else sample_count * 2
-        )
-        receive_samples = (
-            recv_packed_samples
-            if magic in (b"OS12", b"OS13") else recv_samples
-        )
-        samples = receive_samples(connection, sample_count)
-        if samples is None:
-            if not worker_stop.is_set():
-                capture_queue.put(
-                    (None, 0, 0, None, 0, 0.0, 0,
-                     "Incomplete TCP capture received")
-                )
-            break
-        transfer_seconds = time.perf_counter() - transfer_started
+def handle_capture_frame(payload, transfer_started):
+    if len(payload) < 24:
+        raise ValueError("Incomplete USB capture header")
+    (magic, sample_count, buffer_capacity, overflow_count, trigger_index,
+     sample_rate) = struct.unpack_from("<4sIIIII", payload)
+    if (
+        magic != b"OS13"
+        or not SAMPLE_BUFFER_SIZE <= buffer_capacity <= MAX_CAPTURE_SAMPLES
+        or sample_count > buffer_capacity
+        or (sample_count and trigger_index != 0xFFFFFFFF
+            and trigger_index >= sample_count)
+        or not 8 <= sample_rate <= NOMINAL_ADC_SPS
+    ):
+        raise ValueError("Invalid capture header from oscilloscope")
+
+    payload_length = (sample_count // 2) * 3 + (sample_count % 2) * 2
+    if len(payload) != 24 + payload_length:
+        raise ValueError("Invalid capture payload length")
+    if not sample_count:
         capture_queue.put(
-            (samples, buffer_capacity, overflow_count, trigger_index,
-             sample_rate, transfer_seconds, payload_length, None)
+            (None, buffer_capacity, overflow_count, trigger_index,
+             sample_rate, 0.0, 0, None)
         )
+        return
+    samples = unpack_packed_samples(payload[24:], sample_count)
+    capture_queue.put(
+        (samples, buffer_capacity, overflow_count, trigger_index,
+         sample_rate, time.perf_counter() - transfer_started,
+         payload_length, None)
+    )
 
-def status_worker():
-    udp_event_worker(STATUS_PORT, "Trigger status UDP listener", handle_status_packet)
+def handle_serial_frame(frame_type, payload, transfer_started):
+    if frame_type == USB_FRAME_LIVE:
+        handle_live_frame(payload)
+    elif frame_type == USB_FRAME_CAPTURE:
+        handle_capture_frame(payload, transfer_started)
+    elif frame_type == USB_FRAME_STATUS:
+        if not handle_status_packet(payload):
+            raise ValueError("Invalid status frame from oscilloscope")
+    elif frame_type == USB_FRAME_VOLTAGE:
+        if not handle_voltage_packet(payload):
+            raise ValueError("Invalid voltage frame from oscilloscope")
+    else:
+        raise ValueError(f"Unknown USB frame type {frame_type}")
 
-def voltage_worker():
-    udp_event_worker(VOLTAGE_PORT, "ADC voltage UDP listener", handle_voltage_packet)
-
-def udp_event_worker(port, worker_name, packet_handler):
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", port))
-        sock.settimeout(0.5)
-        register_worker_socket(sock)
-        while not worker_stop.is_set():
-            try:
-                packet, sender = sock.recvfrom(64)
-            except socket.timeout:
-                continue
-            if packet_handler(packet):
-                notify_device_seen(sender[0])
-    except OSError as error:
-        report_worker_error(worker_name, error)
-    finally:
-        close_worker_socket(sock)
+def serial_worker():
+    global serial_connection, rx_byte_count, rx_packet_count
+    last_reported_error = None
+    while not worker_stop.is_set():
+        connection = None
+        try:
+            port = find_serial_port()
+            connection = serial.Serial(
+                port, baudrate=SERIAL_BAUD_RATE, timeout=0.1,
+                write_timeout=2.0
+            )
+            with serial_lock:
+                serial_connection = connection
+            last_reported_error = None
+            notify_device_seen("USB")
+            while not worker_stop.is_set():
+                header = serial_read_frame_header(connection)
+                if header is None:
+                    break
+                frame_type, payload_length = struct.unpack_from("<BI", header, 4)
+                if payload_length > 24 + (
+                    (MAX_CAPTURE_SAMPLES // 2) * 3
+                    + (MAX_CAPTURE_SAMPLES % 2) * 2
+                ):
+                    raise ValueError("Oversized USB frame from oscilloscope")
+                transfer_started = time.perf_counter()
+                payload = serial_read_exact(connection, payload_length)
+                if payload is None:
+                    break
+                with stats_lock:
+                    rx_packet_count += 1
+                    rx_byte_count += len(header) + payload_length
+                notify_device_seen("USB")
+                handle_serial_frame(frame_type, payload, transfer_started)
+        except (OSError, ValueError) as error:
+            if not worker_stop.is_set() and str(error) != last_reported_error:
+                report_worker_error("USB serial connection", error)
+                last_reported_error = str(error)
+        finally:
+            with serial_lock:
+                if serial_connection is connection:
+                    serial_connection = None
+            if connection is not None:
+                with contextlib.suppress(serial.SerialException):
+                    connection.close()
+        if not worker_stop.is_set():
+            worker_stop.wait(SERIAL_RETRY_SEC)
 
 def handle_status_packet(packet):
     global device_tx_packet_count, device_tx_error_count
@@ -445,16 +344,23 @@ def handle_voltage_packet(packet):
         return True
     return False
 
+def send_serial_command(command):
+    message = f"{command}\n".encode("ascii")
+    with serial_lock:
+        connection = serial_connection
+        if connection is None or not connection.is_open:
+            raise OSError("Pico USB serial connection is not open")
+        written = connection.write(message)
+        if written != len(message):
+            raise OSError("Incomplete write to Pico USB serial connection")
+
 def stop_workers():
     worker_stop.set()
-    with worker_socket_lock:
-        sockets = tuple(worker_sockets)
-        worker_sockets.clear()
-    for sock in sockets:
-        with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
-        with contextlib.suppress(OSError):
-            sock.close()
+    with serial_lock:
+        connection = serial_connection
+    if connection is not None:
+        with contextlib.suppress(serial.SerialException):
+            connection.close()
     current_thread = threading.current_thread()
     for thread in worker_threads:
         if thread is not current_thread:
@@ -472,6 +378,13 @@ class LivePlot(QtWidgets.QMainWindow):
         self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
         self.history_sample_rate = NOMINAL_ADC_SPS
         self.live_effective_sample_rate = NOMINAL_ADC_SPS
+        self.filter_specs = ()
+        self.filter_sos = None
+        self.live_filter_state = None
+        self.filter_text = ""
+        self.filter_editor = None
+        self.filter_dialog = None
+        self.filter_dialog_error = None
         self.last_raw_capture = None
         self.capture_view_initialized = False
         self.snapped_capture_length_samples = None
@@ -705,6 +618,22 @@ class LivePlot(QtWidgets.QMainWindow):
         visualization_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         visualization_form.addRow("Plot", self.plot_view)
         visualization_form.addRow("Client average", self.client_average)
+        filter_controls = QtWidgets.QWidget()
+        filter_actions = QtWidgets.QHBoxLayout(filter_controls)
+        filter_actions.setContentsMargins(0, 0, 0, 0)
+        self.filter_status_label = QtWidgets.QLabel("No client filters active")
+        self.filter_status_label.setWordWrap(True)
+        self.configure_filters_button = QtWidgets.QPushButton(
+            "Configure filters..."
+        )
+        self.filters_enabled_checkbox = QtWidgets.QCheckBox("On")
+        self.filters_enabled_checkbox.setToolTip(
+            "Quickly enable or bypass the configured client-side filters."
+        )
+        filter_actions.addWidget(self.filter_status_label, 1)
+        filter_actions.addWidget(self.filters_enabled_checkbox)
+        filter_actions.addWidget(self.configure_filters_button)
+        visualization_form.addRow("Client filters", filter_controls)
 
         voltage_card = QtWidgets.QFrame()
         voltage_card.setStyleSheet(READOUT_CARD_STYLE)
@@ -778,7 +707,7 @@ class LivePlot(QtWidgets.QMainWindow):
             "CAPTURES", self.capture_rate_label
         )
         self.last_capture_card = self.create_readout_card(
-            "LAST TCP", self.last_capture_label
+            "LAST USB", self.last_capture_label
         )
         self.capture_count_card = self.create_readout_card(
             "TOTAL", self.capture_count_label
@@ -890,6 +819,12 @@ class LivePlot(QtWidgets.QMainWindow):
         self.client_average.currentIndexChanged.connect(
             self.refresh_client_average
         )
+        self.configure_filters_button.clicked.connect(
+            self.open_filter_dialog
+        )
+        self.filters_enabled_checkbox.toggled.connect(
+            self.on_filters_enabled_changed
+        )
         self.y_scale.currentIndexChanged.connect(self.on_manual_y_change)
         self.y_position.valueChanged.connect(self.on_manual_y_change)
         self.scope_view_box.user_y_interaction.connect(
@@ -963,11 +898,11 @@ class LivePlot(QtWidgets.QMainWindow):
         self.bench_timer = QtCore.QTimer()
         self.bench_timer.timeout.connect(self.update_benchmark)
         self.bench_timer.start(1000)
-        self.control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.last_control_address = None
         self.reset_button.clicked.connect(self.soft_reset_scope)
         self.hard_reset_action.triggered.connect(self.hard_reset_scope)
         self.apply_y_axis_range()
+        self.refresh_filter_coefficients()
         self.refresh_acquisition_time_window()
         self.send_settings()
 
@@ -1107,6 +1042,7 @@ class LivePlot(QtWidgets.QMainWindow):
             frame_queue.queue.clear()
         with capture_queue.mutex:
             capture_queue.queue.clear()
+        self.live_filter_state = None
         self.last_raw_capture = None
         self.capture_view_initialized = False
         self.autoscale_envelope.clear()
@@ -1491,6 +1427,7 @@ class LivePlot(QtWidgets.QMainWindow):
             self.sample_rate.blockSignals(False)
 
         self.live_effective_sample_rate = sample_rate
+        self.refresh_filter_coefficients()
         self.refresh_acquisition_time_window()
         self.refresh_trigger_line()
         self.refresh_once_button()
@@ -1504,9 +1441,9 @@ class LivePlot(QtWidgets.QMainWindow):
             self.status.showMessage("Waiting for Pico connection...")
             return
         try:
-            self.control_socket.sendto(b"OSCR", (viewer_address, CONTROL_PORT))
+            send_serial_command("OSCR")
             self.status.showMessage("Restarting acquisition...", 5000)
-        except OSError as error:
+        except (OSError, serial.SerialException) as error:
             self.status.showMessage(f"Could not reset oscilloscope: {error}", 10000)
 
     def hard_reset_scope(self, *_):
@@ -1514,11 +1451,11 @@ class LivePlot(QtWidgets.QMainWindow):
             self.status.showMessage("Waiting for Pico connection...")
             return
         try:
-            self.control_socket.sendto(b"OSCH", (viewer_address, CONTROL_PORT))
+            send_serial_command("OSCH")
             self.status.showMessage("Hard reset: Pico rebooting", 5000)
             self.last_device_packet_time = None
             self.set_device_connected(False)
-        except OSError as error:
+        except (OSError, serial.SerialException) as error:
             self.status.showMessage(f"Could not reboot oscilloscope: {error}", 10000)
 
     def refresh_sample_rate(self, *_):
@@ -1526,6 +1463,7 @@ class LivePlot(QtWidgets.QMainWindow):
         if sample_rate is None:
             return
         self.live_effective_sample_rate = sample_rate
+        self.refresh_filter_coefficients()
         self.snapped_capture_length_samples = None
         if self.last_raw_capture is None:
             self.history_sample_rate = (
@@ -1554,8 +1492,265 @@ class LivePlot(QtWidgets.QMainWindow):
         grouped = samples[:usable_count].reshape(-1, factor)
         return np.rint(grouped.mean(axis=1)).astype(np.uint16)
 
+    @staticmethod
+    def parse_filter_settings(text):
+        specs = []
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            fields = line.split()
+            kind = fields[0].lower()
+            if kind in ("highpass", "lowpass"):
+                if len(fields) != 3:
+                    raise ValueError(
+                        f"Line {line_number}: use "
+                        f"{kind} <cutoff Hz> <order 1-10>"
+                    )
+                try:
+                    frequency = float(fields[1])
+                    order = int(fields[2])
+                except ValueError as error:
+                    raise ValueError(
+                        f"Line {line_number}: cutoff must be a number "
+                        "and order must be an integer"
+                    ) from error
+                if not np.isfinite(frequency) or frequency <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: cutoff must be positive"
+                    )
+                if not 1 <= order <= 10:
+                    raise ValueError(
+                        f"Line {line_number}: order must be from 1 to 10"
+                    )
+                specs.append((kind, frequency, order))
+            elif kind == "notch":
+                if len(fields) != 3:
+                    raise ValueError(
+                        f"Line {line_number}: use notch <center Hz> <Q>"
+                    )
+                try:
+                    frequency, quality = map(float, fields[1:])
+                except ValueError as error:
+                    raise ValueError(
+                        f"Line {line_number}: center frequency and Q "
+                        "must be numbers"
+                    ) from error
+                if not np.isfinite(frequency) or frequency <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: center frequency must be positive"
+                    )
+                if not np.isfinite(quality) or quality <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: Q must be positive"
+                    )
+                specs.append((kind, frequency, quality))
+            else:
+                raise ValueError(
+                    f"Line {line_number}: unsupported filter '{fields[0]}'"
+                )
+        return tuple(specs)
+
+    @staticmethod
+    def design_filter_chain(specs, sample_rate):
+        sections = []
+        nyquist = sample_rate / 2.0
+        for kind, frequency, parameter in specs:
+            if not 0 < frequency < nyquist:
+                raise ValueError(
+                    f"{kind} frequency {frequency:g} Hz must be below "
+                    f"the Nyquist frequency ({nyquist:g} Hz)"
+                )
+            if kind == "notch":
+                numerator, denominator = signal.iirnotch(
+                    frequency, parameter, fs=sample_rate
+                )
+                sections.append(signal.tf2sos(numerator, denominator))
+            else:
+                sections.append(
+                    signal.butter(
+                        int(parameter), frequency, btype=kind,
+                        fs=sample_rate, output="sos",
+                    )
+                )
+        return np.vstack(sections) if sections else None
+
+    def apply_sample_filters(self, samples, streaming=False):
+        if (
+            not self.filters_enabled_checkbox.isChecked()
+            or self.filter_sos is None
+            or len(samples) == 0
+        ):
+            return samples
+        values = np.asarray(samples, dtype=np.float64)
+        if streaming:
+            if self.live_filter_state is None:
+                self.live_filter_state = signal.sosfilt_zi(
+                    self.filter_sos
+                ) * values[0]
+            filtered, self.live_filter_state = signal.sosfilt(
+                self.filter_sos, values, zi=self.live_filter_state
+            )
+        else:
+            initial_state = signal.sosfilt_zi(self.filter_sos) * values[0]
+            filtered, _ = signal.sosfilt(
+                self.filter_sos, values, zi=initial_state
+            )
+        return filtered
+
+    def apply_capture_filters(self, samples, sample_rate):
+        if (
+            not self.filters_enabled_checkbox.isChecked()
+            or not self.filter_specs
+            or len(samples) == 0
+        ):
+            return samples
+        try:
+            sos = self.design_filter_chain(
+                self.filter_specs,
+                sample_rate / self.client_average_factor(),
+            )
+        except ValueError as error:
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+            return samples
+        if sos is None:
+            return samples
+        values = np.asarray(samples, dtype=np.float64)
+        initial_state = signal.sosfilt_zi(sos) * values[0]
+        filtered, _ = signal.sosfilt(sos, values, zi=initial_state)
+        return filtered
+
+    def refresh_filter_coefficients(self):
+        try:
+            self.filter_sos = self.design_filter_chain(
+                self.filter_specs,
+                self.sample_rate_value() / self.client_average_factor(),
+            )
+        except ValueError as error:
+            self.filter_sos = None
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+        else:
+            self.filter_status_label.setStyleSheet("color: #aaaaaa;")
+            self.update_filter_status()
+        self.live_filter_state = None
+
+    def apply_filter_settings(self, *_):
+        try:
+            specs = self.parse_filter_settings(
+                self.filter_editor.toPlainText()
+            )
+            sample_rate = (
+                self.sample_rate_value() / self.client_average_factor()
+            )
+            sos = self.design_filter_chain(specs, sample_rate)
+        except ValueError as error:
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+            if self.filter_dialog_error is not None:
+                self.filter_dialog_error.setText(str(error))
+            return
+
+        self.filter_text = self.filter_editor.toPlainText()
+        self.filter_specs = specs
+        self.filter_sos = sos
+        self.live_filter_state = None
+        self.filters_enabled_checkbox.blockSignals(True)
+        self.filters_enabled_checkbox.setChecked(bool(specs))
+        self.filters_enabled_checkbox.blockSignals(False)
+        self.filter_status_label.setStyleSheet("color: #aaaaaa;")
+        self.update_filter_status()
+        if self.filter_dialog_error is not None:
+            self.filter_dialog_error.clear()
+        if self.last_raw_capture is not None:
+            samples, buffer_capacity, overflows, trigger_index, sample_rate, \
+                transfer_seconds, payload_length = self.last_raw_capture
+            self.display_capture(
+                samples, buffer_capacity, overflows, trigger_index, sample_rate,
+                transfer_seconds, payload_length, new_capture=False,
+            )
+        else:
+            self.history.fill(0)
+            self.curve.setData(self.x_data, self.history)
+            if self.plot_view.currentIndex() == 1:
+                self.update_spectrum()
+        self.filter_dialog.accept()
+
+    def update_filter_status(self):
+        if not self.filter_specs:
+            message = "No client filters configured"
+        elif not self.filters_enabled_checkbox.isChecked():
+            message = f"{len(self.filter_specs)} filter(s) bypassed"
+        else:
+            message = f"{len(self.filter_specs)} client filter(s) active"
+        self.filter_status_label.setText(message)
+
+    def on_filters_enabled_changed(self, _enabled):
+        self.live_filter_state = None
+        self.update_filter_status()
+        if self.last_raw_capture is not None:
+            samples, buffer_capacity, overflows, trigger_index, sample_rate, \
+                transfer_seconds, payload_length = self.last_raw_capture
+            self.display_capture(
+                samples, buffer_capacity, overflows, trigger_index, sample_rate,
+                transfer_seconds, payload_length, new_capture=False,
+            )
+            return
+        self.history.fill(0)
+        self.curve.setData(self.x_data, self.history)
+        if self.plot_view.currentIndex() == 1:
+            self.update_spectrum()
+
+    def open_filter_dialog(self, *_):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Client-side filters")
+        dialog.setMinimumWidth(440)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        instructions = QtWidgets.QLabel(
+            "Enter one filter per line. Filters cascade from top to bottom.\n"
+            "highpass <cutoff Hz> <order 1-10>\n"
+            "lowpass <cutoff Hz> <order 1-10>\n"
+            "notch <center Hz> <Q>\n"
+            "Use # for comments. Frequencies must be below the Nyquist "
+            "frequency. These filters affect only the client display."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        editor = QtWidgets.QPlainTextEdit()
+        editor.setPlaceholderText(
+            "highpass 50 2\nlowpass 10000 4\nnotch 60 30"
+        )
+        editor.setPlainText(self.filter_text)
+        layout.addWidget(editor)
+        self.filter_editor = editor
+        self.filter_dialog = dialog
+        self.filter_dialog_error = QtWidgets.QLabel()
+        self.filter_dialog_error.setStyleSheet("color: #ff7777;")
+        self.filter_dialog_error.setWordWrap(True)
+        layout.addWidget(self.filter_dialog_error)
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Apply
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Apply
+        ).clicked.connect(self.apply_filter_settings)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        dialog.finished.connect(self.close_filter_dialog)
+        dialog.exec()
+
+    def close_filter_dialog(self, result):
+        if result != QtWidgets.QDialog.DialogCode.Accepted:
+            self.refresh_filter_coefficients()
+        self.filter_editor = None
+        self.filter_dialog = None
+        self.filter_dialog_error = None
+
     def refresh_client_average(self, *_):
         factor = self.client_average_factor()
+        self.refresh_filter_coefficients()
         if self.last_raw_capture is not None:
             samples, buffer_capacity, overflows, trigger_index, sample_rate, \
                 transfer_seconds, payload_length = self.last_raw_capture
@@ -1680,7 +1875,7 @@ class LivePlot(QtWidgets.QMainWindow):
 
     def send_settings(self, *_, mode_override=None):
         if viewer_address is None:
-            self.status.showMessage("Waiting for oscilloscope UDP samples...")
+            self.status.showMessage("Waiting for oscilloscope USB connection...")
             return
 
         mode = mode_override
@@ -1694,11 +1889,9 @@ class LivePlot(QtWidgets.QMainWindow):
             f"{self.trigger_offset.value()}"
         )
         try:
-            self.control_socket.sendto(
-                message.encode("ascii"), (viewer_address, CONTROL_PORT)
-            )
+            send_serial_command(message)
             self.last_control_address = viewer_address
-        except OSError as error:
+        except (OSError, serial.SerialException) as error:
             self.status.showMessage(f"Could not send settings: {error}")
 
     def display_capture(self, samples, buffer_capacity, overflows, trigger_index,
@@ -1712,6 +1905,9 @@ class LivePlot(QtWidgets.QMainWindow):
             )
         factor = self.client_average_factor()
         averaged = self.average_for_display(samples)
+        averaged = self.apply_capture_filters(
+            averaged, effective_sample_rate
+        )
         self.last_capture_length = len(samples)
         self.last_capture_overflows = overflows
         self.last_capture_seconds = transfer_seconds
@@ -1791,6 +1987,7 @@ class LivePlot(QtWidgets.QMainWindow):
 
         new_data = np.concatenate(frames)
         new_data = self.average_for_display(new_data)
+        new_data = self.apply_sample_filters(new_data, streaming=True)
         self.record_autoscale_samples(new_data)
         n = len(new_data)
         self.last_raw_capture = None
@@ -1881,7 +2078,6 @@ class LivePlot(QtWidgets.QMainWindow):
         self.trigger_flash_timer.stop()
         self.overflow_flash_timer.stop()
         stop_workers()
-        self.control_socket.close()
         event.accept()
 
 if __name__ == "__main__":
@@ -1893,10 +2089,7 @@ if __name__ == "__main__":
     with capture_queue.mutex:
         capture_queue.queue.clear()
     worker_threads = [
-        threading.Thread(target=udp_worker, name="sample-udp", daemon=True),
-        threading.Thread(target=tcp_capture_worker, name="capture-tcp", daemon=True),
-        threading.Thread(target=status_worker, name="status-udp", daemon=True),
-        threading.Thread(target=voltage_worker, name="voltage-udp", daemon=True),
+        threading.Thread(target=serial_worker, name="pico-usb-serial", daemon=True),
     ]
     for thread in worker_threads:
         thread.start()
@@ -1905,4 +2098,3 @@ if __name__ == "__main__":
         app.exec()
     finally:
         stop_workers()
-        window.control_socket.close()
