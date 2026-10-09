@@ -7,6 +7,7 @@ import contextlib
 from collections import deque
 import numpy as np
 import pyqtgraph as pg
+from scipy import signal
 from PyQt6 import QtCore, QtWidgets
 
 PORT = 4444
@@ -472,6 +473,13 @@ class LivePlot(QtWidgets.QMainWindow):
         self.x_data = np.linspace(-HISTORY_SEC, 0.0, self.history_samples)
         self.history_sample_rate = NOMINAL_ADC_SPS
         self.live_effective_sample_rate = NOMINAL_ADC_SPS
+        self.filter_specs = ()
+        self.filter_sos = None
+        self.live_filter_state = None
+        self.filter_text = ""
+        self.filter_editor = None
+        self.filter_dialog = None
+        self.filter_dialog_error = None
         self.last_raw_capture = None
         self.capture_view_initialized = False
         self.snapped_capture_length_samples = None
@@ -705,6 +713,22 @@ class LivePlot(QtWidgets.QMainWindow):
         visualization_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         visualization_form.addRow("Plot", self.plot_view)
         visualization_form.addRow("Client average", self.client_average)
+        filter_controls = QtWidgets.QWidget()
+        filter_actions = QtWidgets.QHBoxLayout(filter_controls)
+        filter_actions.setContentsMargins(0, 0, 0, 0)
+        self.filter_status_label = QtWidgets.QLabel("No client filters active")
+        self.filter_status_label.setWordWrap(True)
+        self.configure_filters_button = QtWidgets.QPushButton(
+            "Configure filters…"
+        )
+        self.filters_enabled_checkbox = QtWidgets.QCheckBox("On")
+        self.filters_enabled_checkbox.setToolTip(
+            "Quickly enable or bypass the configured client-side filters."
+        )
+        filter_actions.addWidget(self.filter_status_label, 1)
+        filter_actions.addWidget(self.filters_enabled_checkbox)
+        filter_actions.addWidget(self.configure_filters_button)
+        visualization_form.addRow("Client filters", filter_controls)
 
         voltage_card = QtWidgets.QFrame()
         voltage_card.setStyleSheet(READOUT_CARD_STYLE)
@@ -889,6 +913,12 @@ class LivePlot(QtWidgets.QMainWindow):
         self.plot_view.currentIndexChanged.connect(self.refresh_plot_view)
         self.client_average.currentIndexChanged.connect(
             self.refresh_client_average
+        )
+        self.configure_filters_button.clicked.connect(
+            self.open_filter_dialog
+        )
+        self.filters_enabled_checkbox.toggled.connect(
+            self.on_filters_enabled_changed
         )
         self.y_scale.currentIndexChanged.connect(self.on_manual_y_change)
         self.y_position.valueChanged.connect(self.on_manual_y_change)
@@ -1107,6 +1137,7 @@ class LivePlot(QtWidgets.QMainWindow):
             frame_queue.queue.clear()
         with capture_queue.mutex:
             capture_queue.queue.clear()
+        self.live_filter_state = None
         self.last_raw_capture = None
         self.capture_view_initialized = False
         self.autoscale_envelope.clear()
@@ -1491,6 +1522,7 @@ class LivePlot(QtWidgets.QMainWindow):
             self.sample_rate.blockSignals(False)
 
         self.live_effective_sample_rate = sample_rate
+        self.refresh_filter_coefficients()
         self.refresh_acquisition_time_window()
         self.refresh_trigger_line()
         self.refresh_once_button()
@@ -1526,6 +1558,7 @@ class LivePlot(QtWidgets.QMainWindow):
         if sample_rate is None:
             return
         self.live_effective_sample_rate = sample_rate
+        self.refresh_filter_coefficients()
         self.snapped_capture_length_samples = None
         if self.last_raw_capture is None:
             self.history_sample_rate = (
@@ -1554,8 +1587,267 @@ class LivePlot(QtWidgets.QMainWindow):
         grouped = samples[:usable_count].reshape(-1, factor)
         return np.rint(grouped.mean(axis=1)).astype(np.uint16)
 
+    @staticmethod
+    def parse_filter_settings(text):
+        specs = []
+        for line_number, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            fields = line.split()
+            kind = fields[0].lower()
+            if kind in ("highpass", "lowpass"):
+                if len(fields) != 3:
+                    raise ValueError(
+                        f"Line {line_number}: use "
+                        f"{kind} <cutoff Hz> <order 1-10>"
+                    )
+                try:
+                    frequency = float(fields[1])
+                    order = int(fields[2])
+                except ValueError as error:
+                    raise ValueError(
+                        f"Line {line_number}: cutoff must be a number "
+                        "and order must be an integer"
+                    ) from error
+                if not np.isfinite(frequency) or frequency <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: cutoff must be positive"
+                    )
+                if not 1 <= order <= 10:
+                    raise ValueError(
+                        f"Line {line_number}: order must be from 1 to 10"
+                    )
+                specs.append((kind, frequency, order))
+            elif kind == "notch":
+                if len(fields) != 3:
+                    raise ValueError(
+                        f"Line {line_number}: use notch <center Hz> <Q>"
+                    )
+                try:
+                    frequency, quality = map(float, fields[1:])
+                except ValueError as error:
+                    raise ValueError(
+                        f"Line {line_number}: center frequency and Q "
+                        "must be numbers"
+                    ) from error
+                if not np.isfinite(frequency) or frequency <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: center frequency must be positive"
+                    )
+                if not np.isfinite(quality) or quality <= 0:
+                    raise ValueError(
+                        f"Line {line_number}: Q must be positive"
+                    )
+                specs.append((kind, frequency, quality))
+            else:
+                raise ValueError(
+                    f"Line {line_number}: unsupported filter '{fields[0]}'"
+                )
+        return tuple(specs)
+
+    @staticmethod
+    def design_filter_chain(specs, sample_rate):
+        sections = []
+        nyquist = sample_rate / 2.0
+        for kind, frequency, parameter in specs:
+            if not 0 < frequency < nyquist:
+                raise ValueError(
+                    f"{kind} frequency {frequency:g} Hz must be below "
+                    f"the Nyquist frequency ({nyquist:g} Hz)"
+                )
+            if kind == "notch":
+                numerator, denominator = signal.iirnotch(
+                    frequency, parameter, fs=sample_rate
+                )
+                sections.append(
+                    signal.tf2sos(numerator, denominator)
+                )
+            else:
+                sections.append(
+                    signal.butter(
+                        int(parameter), frequency, btype=kind,
+                        fs=sample_rate, output="sos",
+                    )
+                )
+        return np.vstack(sections) if sections else None
+
+    def apply_sample_filters(self, samples, streaming=False):
+        if (
+            not self.filters_enabled_checkbox.isChecked()
+            or self.filter_sos is None
+            or len(samples) == 0
+        ):
+            return samples
+        values = np.asarray(samples, dtype=np.float64)
+        if streaming:
+            if self.live_filter_state is None:
+                self.live_filter_state = signal.sosfilt_zi(
+                    self.filter_sos
+                ) * values[0]
+            filtered, self.live_filter_state = signal.sosfilt(
+                self.filter_sos, values, zi=self.live_filter_state
+            )
+        else:
+            initial_state = signal.sosfilt_zi(self.filter_sos) * values[0]
+            filtered, _ = signal.sosfilt(
+                self.filter_sos, values, zi=initial_state
+            )
+        return filtered
+
+    def apply_capture_filters(self, samples, sample_rate):
+        if (
+            not self.filters_enabled_checkbox.isChecked()
+            or not self.filter_specs
+            or len(samples) == 0
+        ):
+            return samples
+        try:
+            sos = self.design_filter_chain(
+                self.filter_specs,
+                sample_rate / self.client_average_factor(),
+            )
+        except ValueError as error:
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+            return samples
+        if sos is None:
+            return samples
+        values = np.asarray(samples, dtype=np.float64)
+        initial_state = signal.sosfilt_zi(sos) * values[0]
+        filtered, _ = signal.sosfilt(sos, values, zi=initial_state)
+        return filtered
+
+    def refresh_filter_coefficients(self):
+        try:
+            self.filter_sos = self.design_filter_chain(
+                self.filter_specs,
+                self.sample_rate_value() / self.client_average_factor(),
+            )
+        except ValueError as error:
+            self.filter_sos = None
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+        else:
+            self.filter_status_label.setStyleSheet("color: #aaaaaa;")
+            self.update_filter_status()
+        self.live_filter_state = None
+
+    def apply_filter_settings(self, *_):
+        try:
+            specs = self.parse_filter_settings(
+                self.filter_editor.toPlainText()
+            )
+            sample_rate = (
+                self.sample_rate_value() / self.client_average_factor()
+            )
+            sos = self.design_filter_chain(specs, sample_rate)
+        except ValueError as error:
+            self.filter_status_label.setText(str(error))
+            self.filter_status_label.setStyleSheet("color: #ff7777;")
+            if self.filter_dialog_error is not None:
+                self.filter_dialog_error.setText(str(error))
+            return
+
+        self.filter_text = self.filter_editor.toPlainText()
+        self.filter_specs = specs
+        self.filter_sos = sos
+        self.live_filter_state = None
+        self.filters_enabled_checkbox.blockSignals(True)
+        self.filters_enabled_checkbox.setChecked(bool(specs))
+        self.filters_enabled_checkbox.blockSignals(False)
+        self.filter_status_label.setStyleSheet("color: #aaaaaa;")
+        self.update_filter_status()
+        if self.filter_dialog_error is not None:
+            self.filter_dialog_error.clear()
+        if self.last_raw_capture is not None:
+            samples, buffer_capacity, overflows, trigger_index, sample_rate, \
+                transfer_seconds, payload_length = self.last_raw_capture
+            self.display_capture(
+                samples, buffer_capacity, overflows, trigger_index, sample_rate,
+                transfer_seconds, payload_length, new_capture=False,
+            )
+        else:
+            self.history.fill(0)
+            self.curve.setData(self.x_data, self.history)
+            if self.plot_view.currentIndex() == 1:
+                self.update_spectrum()
+        self.filter_dialog.accept()
+
+    def update_filter_status(self):
+        if not self.filter_specs:
+            message = "No client filters configured"
+        elif not self.filters_enabled_checkbox.isChecked():
+            message = f"{len(self.filter_specs)} filter(s) bypassed"
+        else:
+            message = f"{len(self.filter_specs)} client filter(s) active"
+        self.filter_status_label.setText(message)
+
+    def on_filters_enabled_changed(self, _enabled):
+        self.live_filter_state = None
+        self.update_filter_status()
+        if self.last_raw_capture is not None:
+            samples, buffer_capacity, overflows, trigger_index, sample_rate, \
+                transfer_seconds, payload_length = self.last_raw_capture
+            self.display_capture(
+                samples, buffer_capacity, overflows, trigger_index, sample_rate,
+                transfer_seconds, payload_length, new_capture=False,
+            )
+            return
+        self.history.fill(0)
+        self.curve.setData(self.x_data, self.history)
+        if self.plot_view.currentIndex() == 1:
+            self.update_spectrum()
+
+    def open_filter_dialog(self, *_):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Client-side filters")
+        dialog.setMinimumWidth(440)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        instructions = QtWidgets.QLabel(
+            "Enter one filter per line. Filters cascade from top to bottom.\n"
+            "highpass <cutoff Hz> <order 1-10>\n"
+            "lowpass <cutoff Hz> <order 1-10>\n"
+            "notch <center Hz> <Q>\n"
+            "Use # for comments. Frequencies must be below the Nyquist "
+            "frequency. These filters affect only the client display."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+        editor = QtWidgets.QPlainTextEdit()
+        editor.setPlaceholderText(
+            "highpass 50 2\nlowpass 10000 4\nnotch 60 30"
+        )
+        editor.setPlainText(self.filter_text)
+        layout.addWidget(editor)
+        self.filter_editor = editor
+        self.filter_dialog = dialog
+        self.filter_dialog_error = QtWidgets.QLabel()
+        self.filter_dialog_error.setStyleSheet("color: #ff7777;")
+        self.filter_dialog_error.setWordWrap(True)
+        layout.addWidget(self.filter_dialog_error)
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Apply
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.button(
+            QtWidgets.QDialogButtonBox.StandardButton.Apply
+        ).clicked.connect(self.apply_filter_settings)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        dialog.finished.connect(self.close_filter_dialog)
+        dialog.exec()
+
+    def close_filter_dialog(self, result):
+        if result != QtWidgets.QDialog.DialogCode.Accepted:
+            self.refresh_filter_coefficients()
+        self.filter_editor = None
+        self.filter_dialog = None
+        self.filter_dialog_error = None
+
     def refresh_client_average(self, *_):
         factor = self.client_average_factor()
+        self.refresh_filter_coefficients()
         if self.last_raw_capture is not None:
             samples, buffer_capacity, overflows, trigger_index, sample_rate, \
                 transfer_seconds, payload_length = self.last_raw_capture
@@ -1712,6 +2004,9 @@ class LivePlot(QtWidgets.QMainWindow):
             )
         factor = self.client_average_factor()
         averaged = self.average_for_display(samples)
+        averaged = self.apply_capture_filters(
+            averaged, effective_sample_rate
+        )
         self.last_capture_length = len(samples)
         self.last_capture_overflows = overflows
         self.last_capture_seconds = transfer_seconds
@@ -1791,6 +2086,7 @@ class LivePlot(QtWidgets.QMainWindow):
 
         new_data = np.concatenate(frames)
         new_data = self.average_for_display(new_data)
+        new_data = self.apply_sample_filters(new_data, streaming=True)
         self.record_autoscale_samples(new_data)
         n = len(new_data)
         self.last_raw_capture = None
